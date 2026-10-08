@@ -15,7 +15,7 @@ st.write("학번과 이름을 입력하고 증명사진을 업로드하면, AI�
 # 학생 입력 폼
 col1, col2 = st.columns(2)
 with col1:
-    student_id = st.text_input("학번 (예: 10501)")
+    student_id = st.text_input("학번 (예: 1학년 1반 1번인 경우, 10101)")
 with col2:
     student_name = st.text_input("이름 (예: 홍길동)")
 
