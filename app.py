@@ -81,14 +81,15 @@ def process_single_photo(image):
         # 사진을 못 찾은 경우 원본을 그대로 쓰지 않고 중앙 크롭 형태로 안전하게 대응
         warped = cv2.resize(image, (350, 450), interpolation=cv2.INTER_CUBIC)
 
-    # [핵심 5] 정수리 보호 마진 적용 (위쪽은 2픽셀만, 좌우/아래는 테두리 제거)
-    trim_x = 6
-    trim_y_top = 2     
-    trim_y_bottom = 8  
+# [수정] 검은 테두리와 바깥 잔상을 확실히 날려버리도록 마진을 살짝 늘림
+    trim_x = 12       # 좌우 폭을 조금 더 안쪽으로 잘라냄
+    trim_y_top = 4    # 정수리는 안전하게 보호하면서 미세 테두리 제거
+    trim_y_bottom = 12  # 아래쪽 여백 및 그림자 제거
     
     final_crop = warped[trim_y_top:target_h-trim_y_bottom, trim_x:target_w-trim_x]
     final_image = cv2.resize(final_crop, (350, 450), interpolation=cv2.INTER_CUBIC)
     return final_image
+
 
 def upload_via_gas(file_bytes, file_name):
     """구글 앱스크립트 웹앱을 통해 개인 드라이브로 안전하게 전송"""
