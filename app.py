@@ -3,9 +3,8 @@ import cv2
 import numpy as np
 import os
 import io
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+import base64
+import requests
 
 # 페이지 설정
 st.set_page_config(page_title="증명사진 수집 시스템", page_icon="📸")
@@ -79,25 +78,23 @@ def process_single_photo(image):
     final_image = cv2.resize(final_crop, (350, 450), interpolation=cv2.INTER_CUBIC)
     return final_image
 
-def upload_to_google_drive(file_bytes, file_name):
-    """선생님 구글 드라이브로 자동 업로드하는 함수"""
-    # Streamlit 내장 구조화 테이블을 그대로 가져옴
-    drive_creds = dict(st.secrets["google_drive"])
-    SCOPES = ['https://www.googleapis.com/auth/drive.file']
+def upload_via_gas(file_bytes, file_name):
+    """구글 앱스크립트 웹앱을 통해 개인 드라이브로 안전하게 전송"""
+    gas_url = st.secrets["gas_url"]
     
-    creds = service_account.Credentials.from_service_account_info(drive_creds, scopes=SCOPES)
-    service = build('drive', 'v3', credentials=creds)
+    # 이미지를 Base64 문자열로 인코딩
+    encoded_data = base64.b64encode(file_bytes).decode('utf-8')
     
-    folder_id = st.secrets["google_drive"]["folder_id"]
-    
-    file_metadata = {
-        'name': file_name,
-        'parents': [folder_id]
+    payload = {
+        "fileData": encoded_data,
+        "fileName": file_name,
+        "mimeType": "image/jpeg"
     }
     
-    media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype='image/jpeg', resumable=True)
-    file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-    return file.get('id')
+    response = requests.post(gas_url, json=payload)
+    result = response.json()
+    if result.get("status") != "success":
+        raise Exception(result.get("message", "알 수 없는 전송 오류"))
 
 # 제출 버튼
 if st.button("사진 제출 및 자동 스캔 완료", type="primary"):
@@ -118,7 +115,7 @@ if st.button("사진 제출 및 자동 스캔 완료", type="primary"):
                     st.error("이미지 변환 중 오류가 발생했습니다.")
                 else:
                     file_name = f"{student_id}_{student_name}.jpg"
-                    upload_to_google_drive(buffer.tobytes(), file_name)
+                    upload_via_gas(buffer.tobytes(), file_name)
                     
                     st.success(f"🎉 [{student_id} {student_name}] 학생의 증명사진이 성공적으로 제출 및 자동 보정되었습니다!")
                     st.image(processed_img, channels="BGR", caption="선생님 드라이브에 저장된 최종 보정 사진")
