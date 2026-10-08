@@ -22,6 +22,7 @@ with col2:
 uploaded_file = st.file_uploader("증명사진 파일 업로드 (스마트폰 촬영 또는 파일 선택)", type=['jpg', 'jpeg', 'png', 'JPG', 'JPEG', 'PNG'])
 
 def order_points(pts):
+    """4개의 꼭짓점을 시계 방향(좌상, 우상, 우하, 좌하)으로 정렬"""
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
     rect[0] = pts[np.argmin(s)] 
@@ -32,49 +33,60 @@ def order_points(pts):
     return rect
 
 def process_single_photo(image):
-    """학생이 올린 단일 사진을 스캔 보정하는 핵심 알고리즘"""
+    """선생님이 검증하신 로컬 스캔 알고리즘을 단일 사진에 적용"""
     img_h, img_w = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
+    # [핵심 1] 빛 번짐이나 스캔/촬영 노이즈에 강한 적응형 이진화 + 엣지 추출 혼합
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    thresh_adapt = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 5)
     edged = cv2.Canny(blur, 30, 150)
-    _, mask_scan = cv2.threshold(gray, 235, 255, cv2.THRESH_BINARY_INV)
-    _, mask_dark = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
     
+    combined_mask = cv2.bitwise_or(thresh_adapt, edged)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    combined = cv2.bitwise_or(edged, cv2.bitwise_or(mask_scan, mask_dark))
-    closed = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=2)
+    closed = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     
     contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     
     best_box = None
     max_area = 0
     img_area = img_h * img_w
-    
+
     for c in contours:
+        # [핵심 2] Convex Hull 적용: 삐뚤빼뚤한 테두리를 빳빳하게 폄
         hull = cv2.convexHull(c)
         rect = cv2.minAreaRect(hull)
+        
         w, h = rect[1]
         if w == 0 or h == 0: continue
         if w > h: w, h = h, w
         area = w * h
         
-        if img_area * 0.05 < area < img_area * 0.98 and 0.6 < (w / h) < 0.95:
-            if area > max_area:
-                max_area = area
-                box = cv2.boxPoints(rect)
-                best_box = np.intp(box)
-                
+        # [핵심 3] 엄격한 증명사진 비율 검증 (0.65 ~ 0.90)
+        if img_area * 0.005 < area < img_area * 0.95:
+            if 0.65 < (w / h) < 0.90:
+                if area > max_area:
+                    max_area = area
+                    box = cv2.boxPoints(rect)
+                    best_box = np.intp(box)
+                    
     if best_box is not None:
         ordered_pts = order_points(best_box)
         target_w, target_h = 350, 450
         dst = np.array([[0, 0], [target_w-1, 0], [target_w-1, target_h-1], [0, target_h-1]], dtype="float32")
+        
         M = cv2.getPerspectiveTransform(ordered_pts, dst)
         warped = cv2.warpPerspective(image, M, (target_w, target_h), flags=cv2.INTER_CUBIC)
     else:
+        # 사진을 못 찾은 경우 원본을 그대로 쓰지 않고 중앙 크롭 형태로 안전하게 대응
         warped = cv2.resize(image, (350, 450), interpolation=cv2.INTER_CUBIC)
-        
-    final_crop = warped[2:442, 6:344]
+
+    # [핵심 5] 정수리 보호 마진 적용 (위쪽은 2픽셀만, 좌우/아래는 테두리 제거)
+    trim_x = 6
+    trim_y_top = 2     
+    trim_y_bottom = 8  
+    
+    final_crop = warped[trim_y_top:target_h-trim_y_bottom, trim_x:target_w-trim_x]
     final_image = cv2.resize(final_crop, (350, 450), interpolation=cv2.INTER_CUBIC)
     return final_image
 
@@ -82,9 +94,7 @@ def upload_via_gas(file_bytes, file_name):
     """구글 앱스크립트 웹앱을 통해 개인 드라이브로 안전하게 전송"""
     gas_url = st.secrets["gas_url"]
     
-    # 이미지를 Base64 문자열로 인코딩
     encoded_data = base64.b64encode(file_bytes).decode('utf-8')
-    
     payload = {
         "fileData": encoded_data,
         "fileName": file_name,
