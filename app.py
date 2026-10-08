@@ -8,9 +8,9 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
 # 페이지 설정
-st.set_page_config(page_title="1학년 5반 증명사진 제출 시스템", page_icon="📸")
+st.set_page_config(page_title="증명사진 수집 시스템", page_icon="📸")
 
-st.title("📸 1학년 5반 증명사진 제출 및 자동 스캔")
+st.title("📸 증명사진 수집 및 자동 스캔")
 st.write("학번과 이름을 입력하고 증명사진을 업로드하면, AI가 자동으로 수평을 맞추고 보정하여 선생님 클라우드에 안전하게 저장됩니다.")
 
 # 학생 입력 폼
