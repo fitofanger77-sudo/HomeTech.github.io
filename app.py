@@ -53,7 +53,7 @@ def process_single_photo(image):
         return cv2.resize(image, (350, 450), interpolation=cv2.INTER_CUBIC)
     
     # ==========================================
-    # 아래는 테두리가 어두운 [실물 촬영 사진]인 경우에만 작동하는 기존 정밀 스캔 로직
+    # 아래는 테두리가 어두운 [실물 촬영 사진]인 경우에만 작동하는 정밀 스캔 로직
     # ==========================================
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
