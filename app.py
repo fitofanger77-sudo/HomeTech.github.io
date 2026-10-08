@@ -3,7 +3,6 @@ import cv2
 import numpy as np
 import os
 import io
-import json
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
@@ -82,14 +81,14 @@ def process_single_photo(image):
 
 def upload_to_google_drive(file_bytes, file_name):
     """선생님 구글 드라이브로 자동 업로드하는 함수"""
-    # Secrets에서 JSON 문자열을 그대로 가져와서 딕셔너리로 변환
-    drive_creds = json.loads(st.secrets["google_credentials"])
+    # Streamlit 내장 구조화 테이블을 그대로 가져옴
+    drive_creds = dict(st.secrets["google_drive"])
     SCOPES = ['https://www.googleapis.com/auth/drive.file']
     
     creds = service_account.Credentials.from_service_account_info(drive_creds, scopes=SCOPES)
     service = build('drive', 'v3', credentials=creds)
     
-    folder_id = st.secrets["folder_id"]
+    folder_id = st.secrets["google_drive"]["folder_id"]
     
     file_metadata = {
         'name': file_name,
