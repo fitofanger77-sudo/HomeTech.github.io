@@ -33,11 +33,10 @@ def order_points(pts):
     return rect
 
 def process_single_photo(image):
-    """선생님이 검증하신 로컬 스캔 알고리즘을 단일 사진에 적용"""
+    """사선 꼭짓점 정밀 탐지 및 안쪽 수축 마진을 적용한 스캔 보정 알고리즘"""
     img_h, img_w = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
-    # [핵심 1] 빛 번짐이나 스캔/촬영 노이즈에 강한 적응형 이진화 + 엣지 추출 혼합
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     thresh_adapt = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 5)
     edged = cv2.Canny(blur, 30, 150)
@@ -53,43 +52,61 @@ def process_single_photo(image):
     img_area = img_h * img_w
 
     for c in contours:
-        # [핵심 2] Convex Hull 적용: 삐뚤빼뚤한 테두리를 빳빳하게 폄
         hull = cv2.convexHull(c)
-        rect = cv2.minAreaRect(hull)
+        # 사선 꼭짓점을 더 정밀하게 찾기 위해 다각형 근사화(approxPolyDP) 시도
+        peri = cv2.arcLength(hull, True)
+        approx = cv2.approxPolyDP(hull, 0.02 * peri, True)
         
-        w, h = rect[1]
-        if w == 0 or h == 0: continue
-        if w > h: w, h = h, w
-        area = w * h
-        
-        # [핵심 3] 엄격한 증명사진 비율 검증 (0.65 ~ 0.90)
-        if img_area * 0.005 < area < img_area * 0.95:
-            if 0.65 < (w / h) < 0.90:
+        # 꼭짓점이 4개이면서 일정 크기 이상인 경우 우선 채택
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            area = cv2.contourArea(approx)
+            if img_area * 0.005 < area < img_area * 0.95:
+                # 가로세로 비율 검증 (증명사진 비율 0.65 ~ 0.90)
+                rect = cv2.minAreaRect(approx)
+                w, h = rect[1]
+                if w > h: w, h = h, w
+                if h > 0 and 0.65 < (w / h) < 0.90:
+                    if area > max_area:
+                        max_area = area
+                        best_box = approx.reshape(4, 2)
+                        
+    # 만약 4꼭짓점 다각형이 깔끔하게 안 잡혔다면 기존 minAreaRect 박스로 안전하게 백업
+    if best_box is None:
+        for c in contours:
+            hull = cv2.convexHull(c)
+            rect = cv2.minAreaRect(hull)
+            w, h = rect[1]
+            if w == 0 or h == 0: continue
+            if w > h: w, h = h, w
+            area = w * h
+            if img_area * 0.005 < area < img_area * 0.95 and 0.65 < (w / h) < 0.90:
                 if area > max_area:
                     max_area = area
-                    box = cv2.boxPoints(rect)
-                    best_box = np.intp(box)
+                    best_box = cv2.boxPoints(rect)
                     
     if best_box is not None:
-        ordered_pts = order_points(best_box)
+        ordered_pts = order_points(np.array(best_box, dtype="float32"))
+        
+        # [핵심 아이디어] 찾은 꼭짓점들을 중심점(Centroid) 기준 안쪽으로 1% 정도 살짝 당겨서 테두리 검은 선 원천 차단
+        center = np.mean(ordered_pts, axis=0)
+        ordered_pts = center + (ordered_pts - center) * 0.985
+        
         target_w, target_h = 350, 450
         dst = np.array([[0, 0], [target_w-1, 0], [target_w-1, target_h-1], [0, target_h-1]], dtype="float32")
         
         M = cv2.getPerspectiveTransform(ordered_pts, dst)
         warped = cv2.warpPerspective(image, M, (target_w, target_h), flags=cv2.INTER_CUBIC)
     else:
-        # 사진을 못 찾은 경우 원본을 그대로 쓰지 않고 중앙 크롭 형태로 안전하게 대응
         warped = cv2.resize(image, (350, 450), interpolation=cv2.INTER_CUBIC)
 
-# [수정] 검은 테두리와 바깥 잔상을 확실히 날려버리도록 마진을 살짝 늘림
-    trim_x = 12       # 좌우 폭을 조금 더 안쪽으로 잘라냄
-    trim_y_top = 4    # 정수리는 안전하게 보호하면서 미세 테두리 제거
-    trim_y_bottom = 12  # 아래쪽 여백 및 그림자 제거
+    # 최종 마진 컷 (정수리는 보호하고 미세한 바깥 잔상 제거)
+    trim_x = 8
+    trim_y_top = 2     
+    trim_y_bottom = 8  
     
     final_crop = warped[trim_y_top:target_h-trim_y_bottom, trim_x:target_w-trim_x]
     final_image = cv2.resize(final_crop, (350, 450), interpolation=cv2.INTER_CUBIC)
     return final_image
-
 
 def upload_via_gas(file_bytes, file_name):
     """구글 앱스크립트 웹앱을 통해 개인 드라이브로 안전하게 전송"""
