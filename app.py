@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import os
 import io
+import json
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
@@ -37,7 +38,6 @@ def process_single_photo(image):
     img_h, img_w = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
-    # 어두운 마우스패드 배경과 흰색 스캐너 배경 모두 대응하는 마스크 생성
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     edged = cv2.Canny(blur, 30, 150)
     _, mask_scan = cv2.threshold(gray, 235, 255, cv2.THRESH_BINARY_INV)
@@ -61,7 +61,6 @@ def process_single_photo(image):
         if w > h: w, h = h, w
         area = w * h
         
-        # 사진 영역 감지 조건
         if img_area * 0.05 < area < img_area * 0.98 and 0.6 < (w / h) < 0.95:
             if area > max_area:
                 max_area = area
@@ -75,23 +74,22 @@ def process_single_photo(image):
         M = cv2.getPerspectiveTransform(ordered_pts, dst)
         warped = cv2.warpPerspective(image, M, (target_w, target_h), flags=cv2.INTER_CUBIC)
     else:
-        # 외곽선이 모호할 경우 기본 규격 리사이즈
         warped = cv2.resize(image, (350, 450), interpolation=cv2.INTER_CUBIC)
         
-    # 정수리 보호 및 테두리 마감 컷 (머리 위쪽은 2픽셀만 다듬어 정수리 보호)
     final_crop = warped[2:442, 6:344]
     final_image = cv2.resize(final_crop, (350, 450), interpolation=cv2.INTER_CUBIC)
     return final_image
 
 def upload_to_google_drive(file_bytes, file_name):
     """선생님 구글 드라이브로 자동 업로드하는 함수"""
-    drive_creds = dict(st.secrets["google_drive"])
+    # Secrets에서 JSON 문자열을 그대로 가져와서 딕셔너리로 변환
+    drive_creds = json.loads(st.secrets["google_credentials"])
     SCOPES = ['https://www.googleapis.com/auth/drive.file']
     
     creds = service_account.Credentials.from_service_account_info(drive_creds, scopes=SCOPES)
     service = build('drive', 'v3', credentials=creds)
     
-    folder_id = st.secrets["google_drive"]["folder_id"]
+    folder_id = st.secrets["folder_id"]
     
     file_metadata = {
         'name': file_name,
@@ -111,22 +109,16 @@ if st.button("사진 제출 및 자동 스캔 완료", type="primary"):
     else:
         with st.spinner("사진을 분석하고 정밀 스캔하여 구글 드라이브에 안전하게 저장 중입니다..."):
             try:
-                # 업로드된 이미지 읽기
                 file_bytes = np.frombuffer(uploaded_file.read(), np.uint8)
                 image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
                 
-                # 핵심 스캔 보정 실행
                 processed_img = process_single_photo(image)
                 
-                # JPG 인코딩
                 is_success, buffer = cv2.imencode(".jpg", processed_img)
                 if not is_success:
                     st.error("이미지 변환 중 오류가 발생했습니다.")
                 else:
-                    # 파일명을 '학번_이름.jpg'로 자동 정리
                     file_name = f"{student_id}_{student_name}.jpg"
-                    
-                    # 구글 드라이브로 전송
                     upload_to_google_drive(buffer.tobytes(), file_name)
                     
                     st.success(f"🎉 [{student_id} {student_name}] 학생의 증명사진이 성공적으로 제출 및 자동 보정되었습니다!")
