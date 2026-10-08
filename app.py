@@ -33,8 +33,28 @@ def order_points(pts):
     return rect
 
 def process_single_photo(image):
-    """사선 꼭짓점 정밀 탐지 및 안쪽 수축 마진을 적용한 스캔 보정 알고리즘"""
+    """실물 촬영 사진과 순수 디지털 증명사진 파일을 스마트하게 구분하여 보정"""
     img_h, img_w = image.shape[:2]
+    
+    # [스마트 구분 로직] 이미지의 4방향 가장자리(테두리 5픽셀) 평균 밝기 측정
+    # - 책상/마우스패드 위에서 찍은 실물 사진: 테두리가 어두움 (낮은 밝기)
+    # - 순수 디지털 증명사진 파일: 테두리가 하얗거나 밝음 (높은 밝기)
+    top_b = image[0:5, :, :]
+    bottom_b = image[img_h-5:img_h, :, :]
+    left_b = image[:, 0:5, :]
+    right_b = image[:, img_w-5:img_w, :]
+    
+    border_concat = np.concatenate([top_b.flatten(), bottom_b.flatten(), left_b.flatten(), right_b.flatten()])
+    avg_brightness = np.mean(border_concat)
+    
+    # 만약 테두리가 밝고 하얀 경우 (이미 완성된 디지털 증명사진 파일인 경우)
+    if avg_brightness > 140:
+        # 불필요한 사선 왜곡 없이 곧바로 표준 규격(350x450)으로 깔끔하게 리사이즈
+        return cv2.resize(image, (350, 450), interpolation=cv2.INTER_CUBIC)
+    
+    # ==========================================
+    # 아래는 테두리가 어두운 [실물 촬영 사진]인 경우에만 작동하는 기존 정밀 스캔 로직
+    # ==========================================
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -53,15 +73,12 @@ def process_single_photo(image):
 
     for c in contours:
         hull = cv2.convexHull(c)
-        # 사선 꼭짓점을 더 정밀하게 찾기 위해 다각형 근사화(approxPolyDP) 시도
         peri = cv2.arcLength(hull, True)
         approx = cv2.approxPolyDP(hull, 0.02 * peri, True)
         
-        # 꼭짓점이 4개이면서 일정 크기 이상인 경우 우선 채택
         if len(approx) == 4 and cv2.isContourConvex(approx):
             area = cv2.contourArea(approx)
             if img_area * 0.005 < area < img_area * 0.95:
-                # 가로세로 비율 검증 (증명사진 비율 0.65 ~ 0.90)
                 rect = cv2.minAreaRect(approx)
                 w, h = rect[1]
                 if w > h: w, h = h, w
@@ -70,7 +87,6 @@ def process_single_photo(image):
                         max_area = area
                         best_box = approx.reshape(4, 2)
                         
-    # 만약 4꼭짓점 다각형이 깔끔하게 안 잡혔다면 기존 minAreaRect 박스로 안전하게 백업
     if best_box is None:
         for c in contours:
             hull = cv2.convexHull(c)
@@ -86,8 +102,6 @@ def process_single_photo(image):
                     
     if best_box is not None:
         ordered_pts = order_points(np.array(best_box, dtype="float32"))
-        
-        # [핵심 아이디어] 찾은 꼭짓점들을 중심점(Centroid) 기준 안쪽으로 1% 정도 살짝 당겨서 테두리 검은 선 원천 차단
         center = np.mean(ordered_pts, axis=0)
         ordered_pts = center + (ordered_pts - center) * 0.985
         
@@ -99,7 +113,6 @@ def process_single_photo(image):
     else:
         warped = cv2.resize(image, (350, 450), interpolation=cv2.INTER_CUBIC)
 
-    # 최종 마진 컷 (정수리는 보호하고 미세한 바깥 잔상 제거)
     trim_x = 8
     trim_y_top = 2     
     trim_y_bottom = 8  
