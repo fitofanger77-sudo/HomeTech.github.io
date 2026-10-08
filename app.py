@@ -12,6 +12,20 @@ st.set_page_config(page_title="증명사진 수집 시스템", page_icon="📸")
 st.title("📸 증명사진 수집 및 자동 스캔")
 st.write("학번과 이름을 입력하고 증명사진을 업로드하면, AI가 자동으로 수평을 맞추고 보정하여 선생님 클라우드에 안전하게 저장됩니다.")
 
+# --- ⚙️ 선생님 설정 패널 (쌤동네 배포용 관리자 모드) ---
+with st.expander("⚙️ [선생님 전용 설정] 내 구글 드라이브 연결 (처음 접속 시 1회 입력)"):
+    st.markdown("다른 학교 선생님이신가요? 본인의 **구글 앱스크립트(GAS) 웹 앱 URL**을 아래에 입력하고 저장하면, 학생들이 올린 사진이 선생님의 개인 구글 드라이브로 바로 전송됩니다.")
+    
+    if "gas_url" not in st.session_state:
+        st.session_state["gas_url"] = ""
+        
+    input_url = st.text_input("구글 앱스크립트(GAS) 웹 앱 URL 입력", value=st.session_state["gas_url"], type="password")
+    if st.button("설정 저장하기"):
+        st.session_state["gas_url"] = input_url.strip()
+        st.success("✨ 설정이 저장되었습니다! 이제 학생들이 이 링크로 사진을 제출할 수 있습니다.")
+
+st.markdown("---")
+
 # 학생 입력 폼
 col1, col2 = st.columns(2)
 with col1:
@@ -123,7 +137,9 @@ def process_single_photo(image):
 
 def upload_via_gas(file_bytes, file_name):
     """구글 앱스크립트 웹앱을 통해 개인 드라이브로 안전하게 전송"""
-    gas_url = st.secrets["gas_url"]
+    gas_url = st.session_state.get("gas_url", "").strip()
+    if not gas_url:
+        raise Exception("선생님 설정에서 구글 앱스크립트(GAS) URL이 입력되지 않았습니다! 상단의 [선생님 전용 설정]을 열어 URL을 먼저 등록해주세요.")
     
     encoded_data = base64.b64encode(file_bytes).decode('utf-8')
     payload = {
@@ -139,7 +155,9 @@ def upload_via_gas(file_bytes, file_name):
 
 # 제출 버튼
 if st.button("사진 제출 및 자동 스캔 완료", type="primary"):
-    if not student_id or not student_name:
+    if not st.session_state.get("gas_url"):
+        st.error("🚨 상단의 **[선생님 전용 설정]**을 펼쳐서 본인의 구글 앱스크립트(GAS) URL을 먼저 등록해주세요!")
+    elif not student_id or not student_name:
         st.warning("⚠️ 학번과 이름을 모두 입력해주세요!")
     elif not uploaded_file:
         st.warning("⚠️ 증명사진 파일을 업로드해주세요!")
