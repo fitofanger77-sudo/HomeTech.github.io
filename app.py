@@ -57,23 +57,20 @@ uploaded_file = st.file_uploader("증명사진 파일 업로드 (스마트폰 �
 def robust_order_points(pts):
     """어떤 각도로 기울어져 있어도 좌표 중복 없이 좌상, 우상, 우하, 좌하 순서로 완벽 정렬"""
     pts = np.array(pts, dtype="float32")
-    # X 좌표 기준으로 좌측 2개, 우측 2개 분리
     x_sorted = pts[np.argsort(pts[:, 0]), :]
     left_most = x_sorted[:2, :]
     right_most = x_sorted[2:, :]
 
-    # Y 좌표 기준으로 좌상, 좌하 분리
     left_most = left_most[np.argsort(left_most[:, 1]), :]
     tl, bl = left_most
 
-    # Y 좌표 기준으로 우상, 우하 분리
     right_most = right_most[np.argsort(right_most[:, 1]), :]
     tr, br = right_most
 
     return np.array([tl, tr, br, bl], dtype="float32")
 
 def process_single_photo(image):
-    """복잡한 물건이나 회전된 사진 사이에서도 진짜 증명사진만 정밀 추출"""
+    """폴라로이드나 잡동사니를 배제하고 진짜 증명사진만 정밀 추출"""
     img_h, img_w = image.shape[:2]
     
     # 1. 순수 디지털 원본 파일 감지 (가장자리 평균 밝기)
@@ -92,7 +89,6 @@ def process_single_photo(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     
-    # 조명 및 배경 분리를 위한 다중 마스크 추출
     _, thresh_otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     _, thresh_bright = cv2.threshold(blur, 150, 255, cv2.THRESH_BINARY)
     thresh_adapt = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 5)
@@ -127,37 +123,60 @@ def process_single_photo(image):
         if not (img_area * 0.003 < area < img_area * 0.85):
             continue
             
-        # 증명사진 종횡비 검증 (0.65 ~ 0.85) - 한국 표준 3.5:4.5 = 0.778
-        if not (0.65 < aspect_ratio < 0.85):
+        # 증명사진 종횡비 검증 (0.68 ~ 0.88) - 반명함(0.75) 및 여권(0.778) 수용
+        if not (0.68 < aspect_ratio < 0.88):
             continue
             
         pts_box = cv2.boxPoints(rect)
         
-        # 후보 영역 마스크 생성 후 질감(표준편차)과 밝기 확인
         mask = np.zeros(gray.shape, dtype=np.uint8)
         cv2.drawContours(mask, [np.int32(pts_box)], -1, 255, -1)
         mean_val, std_val = cv2.meanStdDev(gray, mask=mask)
         mean_val = float(mean_val[0][0])
         std_val = float(std_val[0][0])
         
-        # 텅 빈 플라스틱 바닥, 단색 판자 배제
-        if std_val < 22:
-            continue
-        # 어두운 자물쇠나 금속 잡화 배제
-        if mean_val < 70:
+        if std_val < 22 or mean_val < 70:
             continue
             
-        # 채점: 증명사진 규격 비율(0.778) 일치도 최우선 + 내부 인물 질감 및 밝기
-        ratio_diff = abs(aspect_ratio - 0.778)
-        ratio_score = max(0.0, 1.0 - (ratio_diff / 0.10)) * 120.0
+        # 임시 워핑으로 내부 레이아웃 분석
+        ordered_temp = robust_order_points(pts_box)
+        target_w_test, target_h_test = 100, 130
+        dst_test = np.array([[0, 0], [target_w_test-1, 0], [target_w_test-1, target_h_test-1], [0, target_h_test-1]], dtype="float32")
+        M_test = cv2.getPerspectiveTransform(ordered_temp, dst_test)
+        temp_crop = cv2.warpPerspective(gray, M_test, (target_w_test, target_h_test))
+        
+        # [핵심 검증 1] 증명사진 상단 모서리 배경 검사 (균일하고 밝은 스튜디오 배경)
+        top_corners = np.concatenate([temp_crop[:20, :30].flatten(), temp_crop[:20, -30:].flatten()])
+        top_mean = np.mean(top_corners)
+        top_std = np.std(top_corners)
+        
+        # [핵심 검증 2] 폴라로이드 감지 (하단 20% 영역이 두꺼운 흰 프레임인 경우 감점)
+        bottom_strip = temp_crop[105:, 15:85]
+        bottom_mean = np.mean(bottom_strip)
+        bottom_std = np.std(bottom_strip)
+        
+        is_polaroid_like = (bottom_mean > 170 and bottom_std < 25)
+        
+        # 채점 로직
+        # 반명함(0.75) 또는 여권(0.778)과의 최소 오차 계산
+        best_ratio_diff = min(abs(aspect_ratio - 0.75), abs(aspect_ratio - 0.778))
+        ratio_score = max(0.0, 1.0 - (best_ratio_diff / 0.08)) * 80.0
         texture_score = min(std_val / 50.0, 1.5) * 40.0
-        bright_score = min(mean_val / 160.0, 1.0) * 30.0
         
-        # 실제 증명사진 크기(적당한 소형/중형 비율)에 적정 보너스 부여 (과도하게 큰 폴라로이드 견제)
+        # 상단 배경이 밝고 균일할수록 증명사진 가산점 대폭 부여
+        id_bg_score = 0.0
+        if top_mean > 120 and top_std < 35:
+            id_bg_score = 150.0
+            
+        # 적정 크기 보너스 (스마트폰 촬영 시 전형적인 증명사진 비중)
         area_ratio = area / img_area
-        size_score = 30.0 if (0.01 < area_ratio < 0.25) else 0.0
+        size_score = 40.0 if (0.005 < area_ratio < 0.06) else 0.0
         
-        total_score = ratio_score + texture_score + bright_score + size_score
+        total_score = ratio_score + texture_score + id_bg_score + size_score
+        
+        if is_polaroid_like:
+            total_score -= 150.0  # 폴라로이드 패널티
+            
         candidates.append((total_score, pts_box))
         
     best_box = None
