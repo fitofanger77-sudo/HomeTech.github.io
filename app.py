@@ -22,24 +22,26 @@ if current_code:
 st.title("📸 증명사진 수집 및 자동 스캔")
 st.write("학번과 이름을 입력하고 증명사진을 업로드하면, AI가 자동으로 수평을 맞추고 보정하여 선생님 클라우드에 안전하게 저장됩니다.")
 
-# --- ⚙️ 선생님 전용 설정 패널 ---
-with st.expander("⚙️ [선생님 전용] 우리 반 전용 수집 링크 만들기", expanded=(not current_code)):
-    st.markdown("구매하신 선생님이신가요? 본인의 **구글 앱스크립트(GAS) 웹 앱 URL**을 입력하시면, **우리 반 학생들에게 배포할 전용 링크**를 즉시 만들어 드립니다.")
-    
-    gas_input = st.text_input("구글 앱스크립트(GAS) 웹 앱 URL 입력", value=target_gas_url, type="password")
-    
-    if st.button("우리 반 전용 링크 발급하기"):
-        if not gas_input.strip():
-            st.warning("⚠️ 구글 앱스크립트 URL을 입력해주세요!")
-        else:
-            encoded_code = base64.urlsafe_b64encode(gas_input.strip().encode("utf-8")).decode("utf-8")
-            st.query_params["t"] = encoded_code
-            st.rerun()
-
-# 전용 링크 발급 성공 시 안내 배너
-if current_code and target_gas_url:
+# --- ⚙️ 선생님 전용 영역 제어 ---
+# (1) 선생님이 링크를 방금 발급한 순간에만 안내 배너 노출 (학생에게는 보이지 않음)
+if st.session_state.get("is_teacher_creator", False) and current_code:
     st.success("🎉 **우리 반 전용 링크가 활성화되었습니다!**")
-    st.info("👉 **현재 브라우저 주소창의 전체 주소(맨 뒤 '?t=...' 포함)를 복사하여 학생들에게 공유**해 주세요. 학생들은 접속 후 사진만 올리면 선생님 드라이브로 바로 들어옵니다.")
+    st.info("👉 **현재 브라우저 주소창의 전체 주소를 복사하여 학생들에게 공유**해 주세요.\n(학생들이 접속할 때는 이 안내 배너와 설정창이 자동으로 숨겨집니다.)")
+
+# (2) 전용 코드가 없는 기본 주소로 접속했을 때만 선생님 설정창 표시
+if not current_code:
+    with st.expander("⚙️ [선생님 전용] 우리 반 전용 수집 링크 만들기", expanded=True):
+        st.markdown("구매하신 선생님이신가요? 본인의 **구글 앱스크립트(GAS) 웹 앱 URL**을 입력하시면, **우리 반 학생들에게 배포할 전용 링크**를 즉시 만들어 드립니다.")
+        gas_input = st.text_input("구글 앱스크립트(GAS) 웹 앱 URL 입력", type="password")
+        
+        if st.button("우리 반 전용 링크 발급하기"):
+            if not gas_input.strip():
+                st.warning("⚠️ 구글 앱스크립트 URL을 입력해주세요!")
+            else:
+                encoded_code = base64.urlsafe_b64encode(gas_input.strip().encode("utf-8")).decode("utf-8")
+                st.session_state["is_teacher_creator"] = True
+                st.query_params["t"] = encoded_code
+                st.rerun()
 
 st.markdown("---")
 
@@ -67,7 +69,6 @@ def process_single_photo(image):
     """실물 촬영 사진과 순수 디지털 증명사진 파일을 스마트하게 구분하여 보정"""
     img_h, img_w = image.shape[:2]
     
-    # [스마트 구분 로직] 이미지의 4방향 가장자리(테두리 5픽셀) 평균 밝기 측정
     top_b = image[0:5, :, :]
     bottom_b = image[img_h-5:img_h, :, :]
     left_b = image[:, 0:5, :]
@@ -76,13 +77,10 @@ def process_single_photo(image):
     border_concat = np.concatenate([top_b.flatten(), bottom_b.flatten(), left_b.flatten(), right_b.flatten()])
     avg_brightness = np.mean(border_concat)
     
-    # 만약 테두리가 밝고 하얀 경우 (이미 완성된 디지털 증명사진 파일인 경우)
     if avg_brightness > 140:
         return cv2.resize(image, (350, 450), interpolation=cv2.INTER_CUBIC)
     
-    # 테두리가 어두운 [실물 촬영 사진]인 경우에만 작동하는 정밀 스캔 로직
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     thresh_adapt = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 5)
     edged = cv2.Canny(blur, 30, 150)
@@ -148,7 +146,6 @@ def process_single_photo(image):
     return final_image
 
 def upload_via_gas(file_bytes, file_name, gas_url):
-    """구글 앱스크립트 웹앱을 통해 개인 드라이브로 안전하게 전송"""
     encoded_data = base64.b64encode(file_bytes).decode('utf-8')
     payload = {
         "fileData": encoded_data,
@@ -164,7 +161,7 @@ def upload_via_gas(file_bytes, file_name, gas_url):
 # 제출 버튼
 if st.button("사진 제출 및 자동 스캔 완료", type="primary"):
     if not target_gas_url:
-        st.error("🚨 담임 선생님의 구글 드라이브 연결 정보가 없습니다! 상단의 [선생님 전용] 메뉴에서 URL을 먼저 등록하시거나, 선생님께서 공유해주신 전용 링크로 접속해주세요.")
+        st.error("🚨 담임 선생님의 구글 드라이브 연결 정보가 없습니다! 담임 선생님께서 공유해주신 전용 링크로 다시 접속해주세요.")
     elif not student_id or not student_name:
         st.warning("⚠️ 학번과 이름을 모두 입력해주세요!")
     elif not uploaded_file:
@@ -188,3 +185,7 @@ if st.button("사진 제출 및 자동 스캔 완료", type="primary"):
                     st.image(processed_img, channels="BGR", caption="선생님 드라이브에 저장된 최종 보정 사진")
             except Exception as e:
                 st.error(f"처리 중 오류가 발생했습니다: {e}")
+
+# (선택) 학생 화면 하단에 다른 반 링크 생성을 위한 복귀 안내 링크
+if current_code and not st.session_state.get("is_teacher_creator", False):
+    st.markdown("<br><hr><center><small style='color: gray;'>선생님이신가요? <a href='.' style='color: gray; text-decoration: underline;'>새 링크 만들기</a></small></center>", unsafe_allow_html=True)
