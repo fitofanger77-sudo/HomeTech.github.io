@@ -91,7 +91,7 @@ def get_true_quad(contour):
     return cv2.boxPoints(rect).astype("float32")
 
 def refine_and_deskew(warped, target_w=350, target_h=450):
-    """결과물을 재점검하고 삐뚤어 보이면 각도와 테두리를 2차 정밀 보정"""
+    """결과물을 재점검하고 삐뚤어 보이면 각도와 테두리를 2차 정밀 보정 (안전 언패킹)"""
     gray_w = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray_w, 40, 120)
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=45, minLineLength=60, maxLineGap=10)
@@ -99,16 +99,18 @@ def refine_and_deskew(warped, target_w=350, target_h=450):
     angles = []
     if lines is not None:
         for l in lines:
-            x1, y1, x2, y2 = l[0]
-            deg = np.degrees(np.arctan2(y2 - y1, x2 - x1))
-            if abs(deg) < 15:
-                angles.append(deg)
-            elif abs(deg - 180) < 15:
-                angles.append(deg - 180)
-            elif abs(deg + 180) < 15:
-                angles.append(deg + 180)
-            elif abs(abs(deg) - 90) < 15:
-                angles.append(deg - 90 if deg > 0 else deg + 90)
+            line_arr = np.array(l).flatten()
+            if len(line_arr) >= 4:
+                x1, y1, x2, y2 = line_arr[:4]
+                deg = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+                if abs(deg) < 15:
+                    angles.append(deg)
+                elif abs(deg - 180) < 15:
+                    angles.append(deg - 180)
+                elif abs(deg + 180) < 15:
+                    angles.append(deg + 180)
+                elif abs(abs(deg) - 90) < 15:
+                    angles.append(deg - 90 if deg > 0 else deg + 90)
                 
     # 미세한 기울기 오차가 발견되면 중심축 기준 정밀 회전 보정
     if len(angles) >= 2:
@@ -131,24 +133,28 @@ def refine_and_deskew(warped, target_w=350, target_h=450):
     return cv2.resize(final, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
 
 def is_actual_portrait_photo(cropped_img):
-    """자물쇠, 플라스틱 등 잡동사니를 배제하고 실제 사람 얼굴 사진인지 검증"""
+    """사물/책상/자물쇠를 배제하고 실제 사람 얼굴(피부톤 + 이목구비 윤곽) 사진인지 검증"""
     h, w = cropped_img.shape[:2]
     hsv = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2HSV)
-    roi = hsv[int(h * 0.20):int(h * 0.70), int(w * 0.25):int(w * 0.75)]
+    roi_hsv = hsv[int(h * 0.15):int(h * 0.75), int(w * 0.20):int(w * 0.80)]
     
-    lower_skin1 = np.array([0, 28, 55], dtype=np.uint8)
-    upper_skin1 = np.array([25, 185, 255], dtype=np.uint8)
-    lower_skin2 = np.array([170, 28, 55], dtype=np.uint8)
-    upper_skin2 = np.array([180, 185, 255], dtype=np.uint8)
+    # 1. 피부톤 검증
+    lower_skin1 = np.array([0, 25, 50], dtype=np.uint8)
+    upper_skin1 = np.array([25, 190, 255], dtype=np.uint8)
+    lower_skin2 = np.array([170, 25, 50], dtype=np.uint8)
+    upper_skin2 = np.array([180, 190, 255], dtype=np.uint8)
     
-    mask1 = cv2.inRange(roi, lower_skin1, upper_skin1)
-    mask2 = cv2.inRange(roi, lower_skin2, upper_skin2)
+    mask1 = cv2.inRange(roi_hsv, lower_skin1, upper_skin1)
+    mask2 = cv2.inRange(roi_hsv, lower_skin2, upper_skin2)
     skin_mask = cv2.bitwise_or(mask1, mask2)
+    skin_ratio = np.sum(skin_mask > 0) / (roi_hsv.shape[0] * roi_hsv.shape[1])
     
-    skin_ratio = np.sum(skin_mask > 0) / (roi.shape[0] * roi.shape[1])
-    sat_mean = hsv[:, :, 1].mean()
+    # 2. 이목구비 윤곽선 밀도 검증 (눈, 코, 입이 없는 평평한 나무책상/플라스틱 차단)
+    gray_roi = cv2.cvtColor(cropped_img[int(h * 0.15):int(h * 0.75), int(w * 0.20):int(w * 0.80)], cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray_roi, 50, 150)
+    edge_count = (edges > 0).sum()
     
-    return (skin_ratio >= 0.12 and sat_mean >= 22.0)
+    return (skin_ratio >= 0.10 and edge_count >= 150)
 
 def extract_all_photos(image):
     """다중 사진 추출 및 2단계 정밀 보정 파이프라인"""
