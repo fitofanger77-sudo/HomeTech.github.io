@@ -92,8 +92,31 @@ def crop_box(img, pts):
     final_crop = warped[2:target_h-2, 2:target_w-2]
     return cv2.resize(final_crop, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
 
+def is_actual_portrait_photo(cropped_img):
+    """자물쇠, 플라스틱 등 잡동사니를 걸러내고 실제 인물 사진인지 정밀 판별"""
+    h, w = cropped_img.shape[:2]
+    hsv = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2HSV)
+    
+    # 얼굴이 위치하는 중심 영역 (상단 15%~75%, 좌우 20%~80%)
+    roi = hsv[int(h * 0.15):int(h * 0.75), int(w * 0.2):int(w * 0.8)]
+    
+    # 피부톤 HSV 범위 검출
+    lower_skin1 = np.array([0, 25, 50], dtype=np.uint8)
+    upper_skin1 = np.array([25, 190, 255], dtype=np.uint8)
+    lower_skin2 = np.array([170, 25, 50], dtype=np.uint8)
+    upper_skin2 = np.array([180, 190, 255], dtype=np.uint8)
+    
+    mask1 = cv2.inRange(roi, lower_skin1, upper_skin1)
+    mask2 = cv2.inRange(roi, lower_skin2, upper_skin2)
+    skin_mask = cv2.bitwise_or(mask1, mask2)
+    
+    skin_ratio = np.sum(skin_mask > 0) / (roi.shape[0] * roi.shape[1])
+    
+    # 플라스틱(1%) 및 자물쇠(3%) 같은 사물은 탈락 (피부색 비율 10% 이상만 통과)
+    return skin_ratio >= 0.10
+
 def extract_all_photos(image):
-    """한 장 이상의 사진을 모두 탐지하여 리스트로 반환"""
+    """잡동사니를 배제하고 오직 실제 인물 사진만 추출"""
     img_h, img_w = image.shape[:2]
     img_area = img_h * img_w
     
@@ -109,7 +132,6 @@ def extract_all_photos(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     
-    # 다중 임계값 검출
     _, thresh_otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     _, thresh_bright = cv2.threshold(blur, 150, 255, cv2.THRESH_BINARY)
     thresh_adapt = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 5)
@@ -138,7 +160,7 @@ def extract_all_photos(image):
         ar = w / h
         area = w * h
         
-        # 증명사진 및 인화물 비율 (0.62 ~ 0.95), 크기 (0.8% ~ 35%)
+        # 비율 및 크기 필터
         if not (0.62 < ar < 0.95):
             continue
         if not (img_area * 0.008 < area < img_area * 0.35):
@@ -151,7 +173,6 @@ def extract_all_photos(image):
         mean_val = float(mean_val[0][0])
         std_val = float(std_val[0][0])
         
-        # 텅 빈 플라스틱 바닥이나 어두운 배경 배제
         if std_val < 25 or mean_val < 75:
             continue
             
@@ -159,7 +180,6 @@ def extract_all_photos(image):
         approx = cv2.approxPolyDP(hull, 0.025 * peri, True)
         is_quad = 1.0 if (len(approx) == 4 and cv2.isContourConvex(approx)) else 0.0
         
-        # 점수 계산
         ratio_diff = min(abs(ar - 0.75), abs(ar - 0.778))
         ratio_score = max(0.0, 1.0 - (ratio_diff / 0.15)) * 100.0
         score = (is_quad * 40.0) + ratio_score + std_val + (mean_val / 2.0)
@@ -175,10 +195,9 @@ def extract_all_photos(image):
     if not candidates:
         return [cv2.resize(image, (350, 450), interpolation=cv2.INTER_CUBIC)]
         
-    # 면적 및 점수 우선 정렬 (작은 내부 조각보다 큰 사진 외곽선 우선)
     candidates.sort(key=lambda x: (x['score'], x['area']), reverse=True)
     
-    # 중복 제거 (NMS): 겹치거나 내부에 포함된 영역은 배제
+    # NMS (중복 제거)
     distinct = []
     for cand in candidates:
         cx1, cy1 = cand['center']
@@ -186,21 +205,31 @@ def extract_all_photos(image):
         for kept in distinct:
             cx2, cy2 = kept['center']
             dist = np.hypot(cx1 - cx2, cy1 - cy2)
-            # 두 객체의 중심점 거리가 가깝다면 동일 사진으로 판단
             if dist < min(cand['w'], kept['w']) * 0.7:
                 is_overlap = True
                 break
         if not is_overlap:
-            if cand['score'] > 120:  # 자물쇠 등 기타 소품 배제
+            if cand['score'] > 120:
                 distinct.append(cand)
                 
     if not distinct:
         return [cv2.resize(image, (350, 450), interpolation=cv2.INTER_CUBIC)]
         
-    # 위치 기준 정렬 (좌측/상단부터 순서대로 1, 2번 부여)
+    # [핵심 검증] 크롭된 이미지 중 실제 인물 피부가 존재하는 사진만 최종 채택
+    verified_photos = []
+    # 정렬: 위에서 아래, 좌에서 우
     distinct.sort(key=lambda x: (x['center'][1] // 200, x['center'][0]))
     
-    return [crop_box(image, p['pts']) for p in distinct]
+    for p in distinct:
+        crop_img = crop_box(image, p['pts'])
+        if is_actual_portrait_photo(crop_img):
+            verified_photos.append(crop_img)
+            
+    # 만약 피부 검증으로 모두 걸러졌다면 가장 유력한 1개만 안전 반환
+    if not verified_photos:
+        return [crop_box(image, distinct[0]['pts'])]
+        
+    return verified_photos
 
 def upload_via_gas(file_bytes, file_name, gas_url):
     """구글 앱스크립트 웹앱을 통해 개인 드라이브로 전송"""
@@ -229,7 +258,7 @@ if st.button("사진 제출 및 자동 스캔 완료", type="primary"):
                 file_bytes = np.frombuffer(uploaded_file.read(), np.uint8)
                 image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
                 
-                # 다중 사진 추출
+                # 다중 사진 추출 및 인물 검증
                 processed_photos = extract_all_photos(image)
                 uploaded_names = []
                 
@@ -238,7 +267,6 @@ if st.button("사진 제출 및 자동 스캔 완료", type="primary"):
                     if not is_success:
                         continue
                         
-                    # 사진 개수에 따른 파일명 분기 처리
                     if len(processed_photos) == 1:
                         f_name = f"{student_id}_{student_name}.jpg"
                     else:
@@ -250,7 +278,6 @@ if st.button("사진 제출 및 자동 스캔 완료", type="primary"):
                 if uploaded_names:
                     st.success(f"🎉 [{student_id} {student_name}] 학생의 증명사진 {len(uploaded_names)}장이 성공적으로 추출 및 저장되었습니다!")
                     
-                    # 화면에 추출된 사진 갤러리 표시
                     cols = st.columns(len(uploaded_names))
                     for col, (f_name, p_img) in zip(cols, uploaded_names):
                         with col:
