@@ -55,7 +55,7 @@ with col2:
 uploaded_file = st.file_uploader("증명사진 파일 업로드 (스마트폰 촬영 또는 파일 선택)", type=['jpg', 'jpeg', 'png', 'JPG', 'JPEG', 'PNG'])
 
 def robust_order_points(pts):
-    """4개의 꼭짓점을 시계 방향(좌상, 우상, 우하, 좌하)으로 정렬하고 증명사진 세로 방향 유지"""
+    """어떤 각도로 기울어져 있어도 좌표 중복 없이 좌상, 우상, 우하, 좌하 순서로 완벽 정렬"""
     pts = np.array(pts, dtype="float32").reshape(4, 2)
     x_sorted = pts[np.argsort(pts[:, 0]), :]
     left_most = x_sorted[:2, :]
@@ -69,7 +69,7 @@ def robust_order_points(pts):
 
     ordered = np.array([tl, tr, br, bl], dtype="float32")
     
-    # 가로/세로 판별 후 세로 방향으로 회전 보정
+    # 세로 방향 비율 유지
     w = (np.linalg.norm(ordered[0] - ordered[1]) + np.linalg.norm(ordered[3] - ordered[2])) / 2.0
     h = (np.linalg.norm(ordered[1] - ordered[2]) + np.linalg.norm(ordered[0] - ordered[3])) / 2.0
     if w > h:
@@ -78,7 +78,7 @@ def robust_order_points(pts):
     return ordered
 
 def get_true_quad(contour):
-    """인화지의 실제 4개 꼭짓점(빨간 점)을 정밀 검출"""
+    """인화지의 실제 4개 꼭짓점(모서리)을 정밀 검출"""
     hull = cv2.convexHull(contour)
     peri = cv2.arcLength(hull, True)
     
@@ -90,12 +90,50 @@ def get_true_quad(contour):
     rect = cv2.minAreaRect(hull)
     return cv2.boxPoints(rect).astype("float32")
 
+def refine_and_deskew(warped, target_w=350, target_h=450):
+    """결과물을 재점검하고 삐뚤어 보이면 각도와 테두리를 2차 정밀 보정"""
+    gray_w = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray_w, 40, 120)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=45, minLineLength=60, maxLineGap=10)
+    
+    angles = []
+    if lines is not None:
+        for l in lines:
+            x1, y1, x2, y2 = l[0]
+            deg = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+            if abs(deg) < 15:
+                angles.append(deg)
+            elif abs(deg - 180) < 15:
+                angles.append(deg - 180)
+            elif abs(deg + 180) < 15:
+                angles.append(deg + 180)
+            elif abs(abs(deg) - 90) < 15:
+                angles.append(deg - 90 if deg > 0 else deg + 90)
+                
+    # 미세한 기울기 오차가 발견되면 중심축 기준 정밀 회전 보정
+    if len(angles) >= 2:
+        tilt = float(np.median(angles))
+        if 0.25 <= abs(tilt) < 10.0:
+            rot_M = cv2.getRotationMatrix2D((target_w / 2.0, target_h / 2.0), tilt, 1.0)
+            warped = cv2.warpAffine(warped, rot_M, (target_w, target_h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+            
+    # 4개 모서리 바깥 배경 잔상 침범 여부 점검
+    corners = [
+        warped[0:10, 0:10],
+        warped[0:10, target_w-10:target_w],
+        warped[target_h-10:target_h, 0:10],
+        warped[target_h-10:target_h, target_w-10:target_w]
+    ]
+    corner_means = [c.mean() for c in corners]
+    trim = 5 if min(corner_means) < 110 else 2
+    
+    final = warped[trim:target_h-trim, trim:target_w-trim]
+    return cv2.resize(final, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
+
 def is_actual_portrait_photo(cropped_img):
-    """자물쇠, 플라스틱 부품 등 무생물을 걸러내고 실제 사람 얼굴 사진인지 검증"""
+    """자물쇠, 플라스틱 등 잡동사니를 배제하고 실제 사람 얼굴 사진인지 검증"""
     h, w = cropped_img.shape[:2]
     hsv = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2HSV)
-    
-    # 얼굴이 집중된 중앙 상단 영역 (세로 20%~70%, 가로 25%~75%)
     roi = hsv[int(h * 0.20):int(h * 0.70), int(w * 0.25):int(w * 0.75)]
     
     lower_skin1 = np.array([0, 28, 55], dtype=np.uint8)
@@ -108,18 +146,16 @@ def is_actual_portrait_photo(cropped_img):
     skin_mask = cv2.bitwise_or(mask1, mask2)
     
     skin_ratio = np.sum(skin_mask > 0) / (roi.shape[0] * roi.shape[1])
-    
-    # 채도 분석: 자물쇠/회색 플라스틱(채도 낮음) 대비 자연스러운 피부/옷(채도 높음)
     sat_mean = hsv[:, :, 1].mean()
     
-    return (skin_ratio >= 0.15 and sat_mean >= 25.0)
+    return (skin_ratio >= 0.12 and sat_mean >= 22.0)
 
 def extract_all_photos(image):
-    """실제 인물 사진만 추출하고 각 사진의 4개 꼭짓점을 기준으로 수평 정렬"""
+    """다중 사진 추출 및 2단계 정밀 보정 파이프라인"""
     img_h, img_w = image.shape[:2]
     img_area = img_h * img_w
     
-    # 1. 순수 디지털 파일 검사 (가장자리 평균 밝기)
+    # 1. 순수 디지털 원본 파일인지 검사 (가장자리 평균 밝기)
     top_b = image[0:5, :, :]
     bottom_b = image[img_h-5:img_h, :, :]
     left_b = image[:, 0:5, :]
@@ -159,7 +195,6 @@ def extract_all_photos(image):
             continue
             
         quad_pts = get_true_quad(c)
-        
         peri = cv2.arcLength(cv2.convexHull(c), True)
         approx = cv2.approxPolyDP(cv2.convexHull(c), 0.03 * peri, True)
         is_quad = 1.0 if len(approx) == 4 else 0.0
@@ -199,21 +234,23 @@ def extract_all_photos(image):
     
     verified_photos = []
     for p in distinct:
+        # [1단계] 4개 꼭짓점 기준 원근 보정
         ordered_pts = robust_order_points(p['pts'])
         M = cv2.getPerspectiveTransform(ordered_pts, dst)
         warped = cv2.warpPerspective(image, M, (target_w, target_h), flags=cv2.INTER_CUBIC)
         
-        # 실제 인물 사진 검증
-        if is_actual_portrait_photo(warped):
-            trimmed = warped[2:target_h-2, 2:target_w-2]
-            final_p = cv2.resize(trimmed, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
-            verified_photos.append(final_p)
+        # [2단계] 결과물 재점검 및 미세 기울기/테두리 2차 보정
+        refined = refine_and_deskew(warped, target_w, target_h)
+        
+        # [3단계] 실제 사람 얼굴 사진인지 최종 검증
+        if is_actual_portrait_photo(refined):
+            verified_photos.append(refined)
             
     if not verified_photos and distinct:
         ordered_pts = robust_order_points(distinct[0]['pts'])
         M = cv2.getPerspectiveTransform(ordered_pts, dst)
         warped = cv2.warpPerspective(image, M, (target_w, target_h), flags=cv2.INTER_CUBIC)
-        verified_photos.append(warped)
+        verified_photos.append(refine_and_deskew(warped, target_w, target_h))
         
     return verified_photos
 
