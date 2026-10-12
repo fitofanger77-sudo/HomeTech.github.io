@@ -54,26 +54,34 @@ with col2:
 
 uploaded_file = st.file_uploader("증명사진 파일 업로드 (스마트폰 촬영 또는 파일 선택)", type=['jpg', 'jpeg', 'png', 'JPG', 'JPEG', 'PNG'])
 
-def robust_order_points(pts):
-    """어떤 각도로 기울어져 있어도 좌표 중복 없이 좌상, 우상, 우하, 좌하 순서로 완벽 정렬"""
-    pts = np.array(pts, dtype="float32")
-    x_sorted = pts[np.argsort(pts[:, 0]), :]
-    left_most = x_sorted[:2, :]
-    right_most = x_sorted[2:, :]
-
-    left_most = left_most[np.argsort(left_most[:, 1]), :]
-    tl, bl = left_most
-
-    right_most = right_most[np.argsort(right_most[:, 1]), :]
-    tr, br = right_most
-
-    return np.array([tl, tr, br, bl], dtype="float32")
+def order_points_quad(pts):
+    """4개의 꼭짓점을 시계 방향(좌상, 우상, 우하, 좌하)으로 정렬하고 증명사진 세로 방향 보정"""
+    pts = np.array(pts, dtype="float32").reshape(4, 2)
+    center = np.mean(pts, axis=0)
+    
+    # 중심점 기준 각도 정렬 (시계 방향 정렬)
+    angles = np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0])
+    pts_sorted = pts[np.argsort(angles)]
+    
+    # 좌상단(Top-Left: x+y 최소) 점을 0번 인덱스로 회전
+    tl_idx = np.argmin(pts_sorted.sum(axis=1))
+    ordered = np.roll(pts_sorted, -tl_idx, axis=0)
+    
+    # 가로/세로 길이 판별
+    w = (np.linalg.norm(ordered[0] - ordered[1]) + np.linalg.norm(ordered[3] - ordered[2])) / 2.0
+    h = (np.linalg.norm(ordered[1] - ordered[2]) + np.linalg.norm(ordered[0] - ordered[3])) / 2.0
+    
+    # 가로로 누워있는 경우 시계 방향 90도 회전
+    if w > h:
+        ordered = np.roll(ordered, -1, axis=0)
+        
+    return ordered.astype("float32")
 
 def process_single_photo(image):
-    """폴라로이드나 잡동사니를 배제하고 진짜 증명사진만 정밀 추출"""
+    """얼굴만 파고드는 과도한 크롭을 막고, 인화지 전체를 온전히 스캔하는 보정 엔진"""
     img_h, img_w = image.shape[:2]
     
-    # 1. 순수 디지털 원본 파일 감지 (가장자리 평균 밝기)
+    # 1. 순수 디지털 원본 파일인지 판별 (가장자리 평균 밝기)
     top_b = image[0:5, :, :]
     bottom_b = image[img_h-5:img_h, :, :]
     left_b = image[:, 0:5, :]
@@ -89,95 +97,78 @@ def process_single_photo(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     
-    _, thresh_otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    _, thresh_bright = cv2.threshold(blur, 150, 255, cv2.THRESH_BINARY)
     thresh_adapt = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 5)
     edged = cv2.Canny(blur, 30, 150)
     combined_mask = cv2.bitwise_or(thresh_adapt, edged)
     
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    closed_otsu = cv2.morphologyEx(thresh_otsu, cv2.MORPH_CLOSE, kernel, iterations=2)
-    closed_bright = cv2.morphologyEx(thresh_bright, cv2.MORPH_CLOSE, kernel, iterations=2)
-    closed_combined = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    # 인화지 외곽선을 끊김 없이 연결하기 위한 모폴로지 연산
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    closed = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     
-    contours_otsu, _ = cv2.findContours(closed_otsu, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    contours_bright, _ = cv2.findContours(closed_bright, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    contours_combined, _ = cv2.findContours(closed_combined, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     
-    all_contours = list(contours_otsu) + list(contours_bright) + list(contours_combined)
     img_area = img_h * img_w
     candidates = []
 
-    for c in all_contours:
+    for c in contours:
         hull = cv2.convexHull(c)
-        rect = cv2.minAreaRect(hull)
-        (cx, cy), (w, h), angle = rect
+        peri = cv2.arcLength(hull, True)
+        approx = cv2.approxPolyDP(hull, 0.025 * peri, True)
+        
+        # 4각형 후보 우선 추출
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            pts = approx.reshape(4, 2)
+            area = cv2.contourArea(approx)
+        else:
+            rect = cv2.minAreaRect(hull)
+            area = rect[1][0] * rect[1][1]
+            pts = cv2.boxPoints(rect)
+            
+        # 스마트폰 촬영 환경에서 전형적인 증명사진 크기 (0.5% ~ 15%)
+        if not (img_area * 0.005 < area < img_area * 0.15):
+            continue
+            
+        rect_eval = cv2.minAreaRect(np.float32(pts))
+        w, h = rect_eval[1]
         if w == 0 or h == 0:
             continue
         if w > h:
             w, h = h, w
-        area = w * h
         aspect_ratio = w / h
         
-        # 크기 필터링 (너무 작거나 화면 전체를 덮는 배경 제거)
-        if not (img_area * 0.003 < area < img_area * 0.85):
-            continue
-            
-        # 증명사진 종횡비 검증 (0.68 ~ 0.88) - 반명함(0.75) 및 여권(0.778) 수용
+        # 증명사진 규격 비율 검증 (0.68 ~ 0.88)
         if not (0.68 < aspect_ratio < 0.88):
             continue
             
-        pts_box = cv2.boxPoints(rect)
-        
         mask = np.zeros(gray.shape, dtype=np.uint8)
-        cv2.drawContours(mask, [np.int32(pts_box)], -1, 255, -1)
+        cv2.drawContours(mask, [np.int32(pts)], -1, 255, -1)
         mean_val, std_val = cv2.meanStdDev(gray, mask=mask)
         mean_val = float(mean_val[0][0])
         std_val = float(std_val[0][0])
         
-        if std_val < 22 or mean_val < 70:
+        # 텅 빈 플라스틱 바닥(std < 20) 및 어두운 소품(mean < 70) 배제
+        if std_val < 20 or mean_val < 70:
             continue
             
-        # 임시 워핑으로 내부 레이아웃 분석
-        ordered_temp = robust_order_points(pts_box)
-        target_w_test, target_h_test = 100, 130
-        dst_test = np.array([[0, 0], [target_w_test-1, 0], [target_w_test-1, target_h_test-1], [0, target_h_test-1]], dtype="float32")
-        M_test = cv2.getPerspectiveTransform(ordered_temp, dst_test)
-        temp_crop = cv2.warpPerspective(gray, M_test, (target_w_test, target_h_test))
+        # 임시 워핑 검사로 폴라로이드 감지
+        ordered_test = order_points_quad(pts)
+        dst_test = np.array([[0, 0], [99, 0], [99, 129], [0, 129]], dtype="float32")
+        M_test = cv2.getPerspectiveTransform(ordered_test, dst_test)
+        temp_crop = cv2.warpPerspective(gray, M_test, (100, 130))
         
-        # [핵심 검증 1] 증명사진 상단 모서리 배경 검사 (균일하고 밝은 스튜디오 배경)
-        top_corners = np.concatenate([temp_crop[:20, :30].flatten(), temp_crop[:20, -30:].flatten()])
-        top_mean = np.mean(top_corners)
-        top_std = np.std(top_corners)
-        
-        # [핵심 검증 2] 폴라로이드 감지 (하단 20% 영역이 두꺼운 흰 프레임인 경우 감점)
+        # 폴라로이드 판별 (하단 20% 영역이 두꺼운 흰색 여백인지 검사)
         bottom_strip = temp_crop[105:, 15:85]
-        bottom_mean = np.mean(bottom_strip)
-        bottom_std = np.std(bottom_strip)
-        
-        is_polaroid_like = (bottom_mean > 170 and bottom_std < 25)
-        
-        # 채점 로직
-        # 반명함(0.75) 또는 여권(0.778)과의 최소 오차 계산
-        best_ratio_diff = min(abs(aspect_ratio - 0.75), abs(aspect_ratio - 0.778))
-        ratio_score = max(0.0, 1.0 - (best_ratio_diff / 0.08)) * 80.0
-        texture_score = min(std_val / 50.0, 1.5) * 40.0
-        
-        # 상단 배경이 밝고 균일할수록 증명사진 가산점 대폭 부여
-        id_bg_score = 0.0
-        if top_mean > 120 and top_std < 35:
-            id_bg_score = 150.0
+        if np.mean(bottom_strip) > 175 and np.std(bottom_strip) < 22:
+            continue  # 폴라로이드 사진 탈락
             
-        # 적정 크기 보너스 (스마트폰 촬영 시 전형적인 증명사진 비중)
-        area_ratio = area / img_area
-        size_score = 40.0 if (0.005 < area_ratio < 0.06) else 0.0
+        # 비율 적합도 + 면적 가중치 (얼굴 내부 조각 대신 인화지 전체 외곽 우선)
+        ratio_diff = min(abs(aspect_ratio - 0.75), abs(aspect_ratio - 0.778))
+        ratio_score = max(0.0, 1.0 - (ratio_diff / 0.10)) * 100.0
+        area_score = (area / img_area) * 500.0  # 더 큰 외곽 인화지 우대
+        is_quad_bonus = 30.0 if len(approx) == 4 else 0.0
         
-        total_score = ratio_score + texture_score + id_bg_score + size_score
-        
-        if is_polaroid_like:
-            total_score -= 150.0  # 폴라로이드 패널티
-            
-        candidates.append((total_score, pts_box))
+        total_score = ratio_score + area_score + is_quad_bonus
+        candidates.append((total_score, pts))
         
     best_box = None
     if candidates:
@@ -185,9 +176,7 @@ def process_single_photo(image):
         best_box = candidates[0][1]
 
     if best_box is not None:
-        ordered_pts = robust_order_points(best_box)
-        center = np.mean(ordered_pts, axis=0)
-        ordered_pts = center + (ordered_pts - center) * 0.985
+        ordered_pts = order_points_quad(best_box)
         
         target_w, target_h = 350, 450
         dst = np.array([[0, 0], [target_w-1, 0], [target_w-1, target_h-1], [0, target_h-1]], dtype="float32")
@@ -197,11 +186,10 @@ def process_single_photo(image):
     else:
         warped = cv2.resize(image, (350, 450), interpolation=cv2.INTER_CUBIC)
 
-    trim_x = 8
-    trim_y_top = 2     
-    trim_y_bottom = 8  
-    
-    final_crop = warped[trim_y_top:target_h-trim_y_bottom, trim_x:target_w-trim_x]
+    # 어깨와 머리가 잘리지 않도록 미세 테두리만 정리 (2픽셀 안전 마진)
+    trim_x = 2
+    trim_y = 2
+    final_crop = warped[trim_y:target_h-trim_y, trim_x:target_w-trim_x]
     final_image = cv2.resize(final_crop, (350, 450), interpolation=cv2.INTER_CUBIC)
     return final_image
 
