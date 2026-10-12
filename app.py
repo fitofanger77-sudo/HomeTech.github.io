@@ -25,12 +25,10 @@ st.title("📸 증명사진 수집 및 자동 스캔")
 st.write("학번과 이름을 입력하고 증명사진을 업로드하면, AI가 자동으로 수평을 맞추고 보정하여 선생님 클라우드에 안전하게 저장됩니다.")
 
 # --- ⚙️ 선생님 전용 영역 제어 ---
-# 선생님이 링크를 방금 발급한 순간에만 안내 배너 표시 (학생에게는 숨김)
 if st.session_state.get("is_teacher_creator", False) and current_code:
     st.success("🎉 **우리 반 전용 링크가 활성화되었습니다!**")
     st.info("👉 **현재 브라우저 주소창의 전체 주소를 복사하여 학생들에게 공유**해 주세요.\n(학생들이 접속할 때는 이 안내 배너와 설정창이 자동으로 숨겨집니다.)")
 
-# 전용 코드가 없는 기본 주소로 접속했을 때만 선생님 설정창 표시
 if not current_code:
     with st.expander("⚙️ [선생님 전용] 우리 반 전용 수집 링크 만들기", expanded=True):
         st.markdown("구매하신 선생님이신가요? 본인의 **구글 앱스크립트(GAS) 웹 앱 URL**을 입력하시면, **우리 반 학생들에게 배포할 전용 링크**를 즉시 만들어 드립니다.")
@@ -56,22 +54,29 @@ with col2:
 
 uploaded_file = st.file_uploader("증명사진 파일 업로드 (스마트폰 촬영 또는 파일 선택)", type=['jpg', 'jpeg', 'png', 'JPG', 'JPEG', 'PNG'])
 
-def order_points(pts):
-    """4개의 꼭짓점을 시계 방향(좌상, 우상, 우하, 좌하)으로 정렬"""
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)] 
-    rect[2] = pts[np.argmax(s)] 
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)] 
-    rect[3] = pts[np.argmax(diff)] 
-    return rect
+def robust_order_points(pts):
+    """어떤 각도로 기울어져 있어도 좌표 중복 없이 좌상, 우상, 우하, 좌하 순서로 완벽 정렬"""
+    pts = np.array(pts, dtype="float32")
+    # X 좌표 기준으로 좌측 2개, 우측 2개 분리
+    x_sorted = pts[np.argsort(pts[:, 0]), :]
+    left_most = x_sorted[:2, :]
+    right_most = x_sorted[2:, :]
+
+    # Y 좌표 기준으로 좌상, 좌하 분리
+    left_most = left_most[np.argsort(left_most[:, 1]), :]
+    tl, bl = left_most
+
+    # Y 좌표 기준으로 우상, 우하 분리
+    right_most = right_most[np.argsort(right_most[:, 1]), :]
+    tr, br = right_most
+
+    return np.array([tl, tr, br, bl], dtype="float32")
 
 def process_single_photo(image):
-    """복잡한 배경 및 잡화 속에서도 진짜 증명사진만 콕 집어내는 고정밀 스캔 알고리즘"""
+    """복잡한 물건이나 회전된 사진 사이에서도 진짜 증명사진만 정밀 추출"""
     img_h, img_w = image.shape[:2]
     
-    # 1. 디지털 원본 파일인지 판별 (가장자리 평균 밝기)
+    # 1. 순수 디지털 원본 파일 감지 (가장자리 평균 밝기)
     top_b = image[0:5, :, :]
     bottom_b = image[img_h-5:img_h, :, :]
     left_b = image[:, 0:5, :]
@@ -87,13 +92,9 @@ def process_single_photo(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     
-    # 1) 조명 변화에 적응하는 오츠(Otsu) 이진화 (흰 인화지 분리)
+    # 조명 및 배경 분리를 위한 다중 마스크 추출
     _, thresh_otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
-    # 2) 고정 임계값 이진화 (어두운/회색 배경에서 흰 종이 분리)
     _, thresh_bright = cv2.threshold(blur, 150, 255, cv2.THRESH_BINARY)
-    
-    # 3) 적응형 이진화 + Canny (나무 책상 등 경계선 추출)
     thresh_adapt = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 5)
     edged = cv2.Canny(blur, 30, 150)
     combined_mask = cv2.bitwise_or(thresh_adapt, edged)
@@ -113,59 +114,51 @@ def process_single_photo(image):
 
     for c in all_contours:
         hull = cv2.convexHull(c)
-        peri = cv2.arcLength(hull, True)
-        approx = cv2.approxPolyDP(hull, 0.02 * peri, True)
-        
-        is_quad = False
-        if len(approx) == 4 and cv2.isContourConvex(approx):
-            pts_to_check = approx.reshape(4, 2)
-            area = cv2.contourArea(approx)
-            is_quad = True
-        else:
-            rect = cv2.minAreaRect(hull)
-            area = rect[1][0] * rect[1][1]
-            pts_to_check = cv2.boxPoints(rect)
-            
-        # 너무 작거나(0.3% 미만) 화면 전체를 덮는 배경(90% 초과) 제거
-        if not (img_area * 0.003 < area < img_area * 0.90):
-            continue
-            
-        rect = cv2.minAreaRect(np.float32(pts_to_check))
-        w, h = rect[1]
+        rect = cv2.minAreaRect(hull)
+        (cx, cy), (w, h), angle = rect
         if w == 0 or h == 0:
             continue
         if w > h:
             w, h = h, w
+        area = w * h
         aspect_ratio = w / h
         
-        # 증명사진 종횡비 (0.65 ~ 0.90) - 한국 표준 3.5:4.5 = 0.778
-        if not (0.65 < aspect_ratio < 0.90):
+        # 크기 필터링 (너무 작거나 화면 전체를 덮는 배경 제거)
+        if not (img_area * 0.003 < area < img_area * 0.85):
             continue
             
-        # 후보 영역 마스크 생성 후 밝기 및 질감(표준편차) 검증
+        # 증명사진 종횡비 검증 (0.65 ~ 0.85) - 한국 표준 3.5:4.5 = 0.778
+        if not (0.65 < aspect_ratio < 0.85):
+            continue
+            
+        pts_box = cv2.boxPoints(rect)
+        
+        # 후보 영역 마스크 생성 후 질감(표준편차)과 밝기 확인
         mask = np.zeros(gray.shape, dtype=np.uint8)
-        cv2.drawContours(mask, [np.int32(pts_to_check)], -1, 255, -1)
+        cv2.drawContours(mask, [np.int32(pts_box)], -1, 255, -1)
         mean_val, std_val = cv2.meanStdDev(gray, mask=mask)
         mean_val = float(mean_val[0][0])
         std_val = float(std_val[0][0])
         
-        # [핵심 검증 1] 텅 빈 서랍 플라스틱 바닥, 마우스패드 차단 (표준편차 22 미만 탈락)
+        # 텅 빈 플라스틱 바닥, 단색 판자 배제
         if std_val < 22:
             continue
-            
-        # [핵심 검증 2] 어두운 자물쇠나 잡동사니 차단 (평균 밝기 70 미만 탈락)
+        # 어두운 자물쇠나 금속 잡화 배제
         if mean_val < 70:
             continue
             
-        # 적합도 채점 (비율 일치도 + 인물 질감 + 밝기 + 사각형 보너스)
+        # 채점: 증명사진 규격 비율(0.778) 일치도 최우선 + 내부 인물 질감 및 밝기
         ratio_diff = abs(aspect_ratio - 0.778)
-        ratio_score = max(0.0, 1.0 - (ratio_diff / 0.15)) * 100.0
-        texture_score = min(std_val / 50.0, 1.5) * 50.0
-        bright_score = min(mean_val / 180.0, 1.0) * 40.0
-        shape_bonus = 30.0 if is_quad else 0.0
+        ratio_score = max(0.0, 1.0 - (ratio_diff / 0.10)) * 120.0
+        texture_score = min(std_val / 50.0, 1.5) * 40.0
+        bright_score = min(mean_val / 160.0, 1.0) * 30.0
         
-        total_score = ratio_score + texture_score + bright_score + shape_bonus
-        candidates.append((total_score, pts_to_check))
+        # 실제 증명사진 크기(적당한 소형/중형 비율)에 적정 보너스 부여 (과도하게 큰 폴라로이드 견제)
+        area_ratio = area / img_area
+        size_score = 30.0 if (0.01 < area_ratio < 0.25) else 0.0
+        
+        total_score = ratio_score + texture_score + bright_score + size_score
+        candidates.append((total_score, pts_box))
         
     best_box = None
     if candidates:
@@ -173,7 +166,7 @@ def process_single_photo(image):
         best_box = candidates[0][1]
 
     if best_box is not None:
-        ordered_pts = order_points(np.array(best_box, dtype="float32"))
+        ordered_pts = robust_order_points(best_box)
         center = np.mean(ordered_pts, axis=0)
         ordered_pts = center + (ordered_pts - center) * 0.985
         
