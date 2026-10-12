@@ -25,12 +25,10 @@ st.title("📸 증명사진 수집 및 자동 스캔")
 st.write("학번과 이름을 입력하고 증명사진을 업로드하면, AI가 자동으로 수평을 맞추고 보정하여 선생님 클라우드에 안전하게 저장됩니다.")
 
 # --- ⚙️ 선생님 전용 영역 제어 ---
-# (1) 선생님이 링크를 방금 발급한 순간에만 안내 배너 노출 (학생에게는 보이지 않음)
 if st.session_state.get("is_teacher_creator", False) and current_code:
     st.success("🎉 **우리 반 전용 링크가 활성화되었습니다!**")
     st.info("👉 **현재 브라우저 주소창의 전체 주소를 복사하여 학생들에게 공유**해 주세요.\n(학생들이 접속할 때는 이 안내 배너와 설정창이 자동으로 숨겨집니다.)")
 
-# (2) 전용 코드가 없는 기본 주소로 접속했을 때만 선생님 설정창 표시
 if not current_code:
     with st.expander("⚙️ [선생님 전용] 우리 반 전용 수집 링크 만들기", expanded=True):
         st.markdown("구매하신 선생님이신가요? 본인의 **구글 앱스크립트(GAS) 웹 앱 URL**을 입력하시면, **우리 반 학생들에게 배포할 전용 링크**를 즉시 만들어 드립니다.")
@@ -68,10 +66,10 @@ def order_points(pts):
     return rect
 
 def process_single_photo(image):
-    """실물 촬영 사진과 순수 디지털 증명사진 파일을 스마트하게 구분하여 보정"""
+    """다양한 잡화나 배경 속에서도 증명사진만 정밀 추출하는 스마트 알고리즘"""
     img_h, img_w = image.shape[:2]
     
-    # [스마트 구분] 테두리 4변의 평균 밝기 측정 (디지털 파일 감지)
+    # 1. 디지털 원본 파일인지 판별 (가장자리 평균 밝기)
     top_b = image[0:5, :, :]
     bottom_b = image[img_h-5:img_h, :, :]
     left_b = image[:, 0:5, :]
@@ -80,20 +78,19 @@ def process_single_photo(image):
     border_concat = np.concatenate([top_b.flatten(), bottom_b.flatten(), left_b.flatten(), right_b.flatten()])
     avg_brightness = np.mean(border_concat)
     
-    # 이미 완성된 디지털 파일인 경우 왜곡 없이 리사이즈
     if avg_brightness > 140:
         return cv2.resize(image, (350, 450), interpolation=cv2.INTER_CUBIC)
     
-    # ==========================================
-    # 실물 촬영본 정밀 감지 로직 (어두운 배경 대응)
-    # ==========================================
+    # 2. 실물 촬영 사진 분석
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     
-    # 1) 흰 종이 추출 전용 밝기 마스크 (마우스패드 등 어두운 바닥 분리)
-    _, thresh_bright = cv2.threshold(blur, 120, 255, cv2.THRESH_BINARY)
+    # 얼굴 검출기 로드 (OpenCV 기본 내장 파일)
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=3, minSize=(30, 30))
     
-    # 2) 적응형 이진화 + Canny 엣지 (일반 바닥/나무 책상 분리)
+    # 이진화 및 엣지 검출
+    _, thresh_bright = cv2.threshold(blur, 150, 255, cv2.THRESH_BINARY)
     thresh_adapt = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 5)
     edged = cv2.Canny(blur, 30, 150)
     combined_mask = cv2.bitwise_or(thresh_adapt, edged)
@@ -114,7 +111,6 @@ def process_single_photo(image):
         peri = cv2.arcLength(hull, True)
         approx = cv2.approxPolyDP(hull, 0.02 * peri, True)
         
-        pts_to_check = None
         if len(approx) == 4 and cv2.isContourConvex(approx):
             pts_to_check = approx.reshape(4, 2)
             area = cv2.contourArea(approx)
@@ -123,7 +119,7 @@ def process_single_photo(image):
             area = rect[1][0] * rect[1][1]
             pts_to_check = cv2.boxPoints(rect)
             
-        if not (img_area * 0.005 < area < img_area * 0.95):
+        if not (img_area * 0.003 < area < img_area * 0.90):
             continue
             
         rect = cv2.minAreaRect(np.float32(pts_to_check))
@@ -134,23 +130,41 @@ def process_single_photo(image):
             w, h = h, w
         aspect_ratio = w / h
         
-        # 증명사진 비율 (0.60 ~ 0.95)
+        # 증명사진 종횡비 검증 (0.60 ~ 0.95)
         if not (0.60 < aspect_ratio < 0.95):
             continue
             
-        # [핵심 검증] 후보 영역 내부의 평균 밝기 확인
-        # 검은 마우스패드(밝기 20~50)는 탈락, 흰 증명사진 종이(밝기 80 이상)만 선별
+        # 후보 영역 마스크 생성 후 밝기 및 표준편차(질감) 계산
         mask = np.zeros(gray.shape, dtype=np.uint8)
         cv2.drawContours(mask, [np.int32(pts_to_check)], -1, 255, -1)
-        mean_val = cv2.mean(gray, mask=mask)[0]
+        mean_val, std_val = cv2.meanStdDev(gray, mask=mask)
+        mean_val = mean_val[0][0]
+        std_val = std_val[0][0]
         
-        if mean_val < 80:
+        # [핵심 1] 텅 빈 무늬 없는 플라스틱 서랍 바닥 탈락 (표준편차 필터)
+        if std_val < 25:
             continue
             
-        # 규격 적합도 채점 (3.5x4.5 비율 기준 + 밝기 + 다각형 가산점)
+        # [핵심 2] 어두운 배경 영역 탈락
+        if mean_val < 75:
+            continue
+            
+        # [핵심 3] 후보 영역 내 실제 얼굴 포함 여부 검사
+        contains_face = False
+        for (fx, fy, fw, fh) in faces:
+            fcx, fcy = fx + fw / 2.0, fy + fh / 2.0
+            if cv2.pointPolygonTest(np.int32(pts_to_check), (fcx, fcy), False) >= 0:
+                contains_face = True
+                break
+                
+        # 적합도 채점
         ratio_diff = abs(aspect_ratio - 0.77)
-        shape_bonus = 20 if (len(approx) == 4 and cv2.isContourConvex(approx)) else 0
-        score = (1.0 - ratio_diff) * 100 + (mean_val / 255.0) * 30 + shape_bonus
+        score = (1.0 - ratio_diff) * 100 + (std_val / 50.0) * 30
+        if contains_face:
+            score += 500  # 얼굴이 확인된 진짜 증명사진에 압도적 가중치
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            score += 20
+            
         candidates.append((score, pts_to_check))
         
     best_box = None
