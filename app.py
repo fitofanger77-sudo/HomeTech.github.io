@@ -55,7 +55,7 @@ with col2:
 uploaded_file = st.file_uploader("증명사진 파일 업로드 (스마트폰 촬영 또는 파일 선택)", type=['jpg', 'jpeg', 'png', 'JPG', 'JPEG', 'PNG'])
 
 def robust_order_points(pts):
-    """어떤 각도로 기울어져 있어도 좌표 중복 없이 좌상, 우상, 우하, 좌하 순서로 완벽 정렬"""
+    """4개의 꼭짓점을 시계 방향(좌상, 우상, 우하, 좌하)으로 정렬"""
     pts = np.array(pts, dtype="float32").reshape(4, 2)
     x_sorted = pts[np.argsort(pts[:, 0]), :]
     left_most = x_sorted[:2, :]
@@ -69,7 +69,6 @@ def robust_order_points(pts):
 
     ordered = np.array([tl, tr, br, bl], dtype="float32")
     
-    # 세로 방향 비율 유지
     w = (np.linalg.norm(ordered[0] - ordered[1]) + np.linalg.norm(ordered[3] - ordered[2])) / 2.0
     h = (np.linalg.norm(ordered[1] - ordered[2]) + np.linalg.norm(ordered[0] - ordered[3])) / 2.0
     if w > h:
@@ -78,20 +77,47 @@ def robust_order_points(pts):
     return ordered
 
 def get_true_quad(contour):
-    """인화지의 실제 4개 꼭짓점(모서리)을 정밀 검출"""
+    """인화지의 실제 4개 꼭짓점 정밀 검출"""
     hull = cv2.convexHull(contour)
     peri = cv2.arcLength(hull, True)
-    
     for eps in [0.03, 0.04, 0.02, 0.05, 0.015]:
         approx = cv2.approxPolyDP(hull, eps * peri, True)
         if len(approx) == 4 and cv2.isContourConvex(approx):
             return approx.reshape(4, 2).astype("float32")
-            
     rect = cv2.minAreaRect(hull)
     return cv2.boxPoints(rect).astype("float32")
 
+def correct_orientation(img):
+    """얼굴(피부)과 상단 배경, 옷의 위치를 분석하여 항상 머리가 위로 가도록 자동 회전"""
+    best_rot = img
+    max_score = -1e9
+    for k in [0, 1, 2, 3]:
+        rot = np.rot90(img, k)
+        rh, rw = rot.shape[:2]
+        hsv = cv2.cvtColor(rot, cv2.COLOR_BGR2HSV)
+        
+        # 상단 얼굴 영역 피부톤
+        face_roi = hsv[int(rh * 0.20):int(rh * 0.65), int(rw * 0.20):int(rw * 0.80)]
+        lower_skin = np.array([0, 25, 50], dtype=np.uint8)
+        upper_skin = np.array([25, 190, 255], dtype=np.uint8)
+        skin_mask = cv2.inRange(face_roi, lower_skin, upper_skin)
+        skin_ratio = (skin_mask > 0).mean()
+        
+        top_val = cv2.cvtColor(rot[:int(rh * 0.15), :], cv2.COLOR_BGR2GRAY).mean()
+        body_val = cv2.cvtColor(rot[int(rh * 0.70):, :], cv2.COLOR_BGR2GRAY).mean()
+        
+        score = skin_ratio * 120.0 + (top_val - body_val) * 0.4
+        if score > max_score:
+            max_score = score
+            best_rot = rot
+    return best_rot
+
 def refine_and_deskew(warped, target_w=350, target_h=450):
-    """결과물을 재점검하고 삐뚤어 보이면 각도와 테두리를 2차 정밀 보정 (안전 언패킹)"""
+    """결과물을 재점검하고 미세 기울기와 각도를 2차 정밀 보정"""
+    warped = correct_orientation(warped)
+    if warped.shape[0] != target_h or warped.shape[1] != target_w:
+        warped = cv2.resize(warped, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
+        
     gray_w = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray_w, 40, 120)
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=45, minLineLength=60, maxLineGap=10)
@@ -131,39 +157,86 @@ def refine_and_deskew(warped, target_w=350, target_h=450):
     return cv2.resize(final, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
 
 def is_actual_portrait_photo(cropped_img):
-    """사물/책상/자물쇠를 배제하고 실제 사람 얼굴(피부톤 + 이목구비 윤곽) 사진인지 엄격 검증"""
+    """엄격한 증명사진 최종 자가 검증 (피부톤 + 이목구비 + 전체명암)"""
     h, w = cropped_img.shape[:2]
     hsv = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2HSV)
-    roi_hsv = hsv[int(h * 0.15):int(h * 0.75), int(w * 0.20):int(w * 0.80)]
+    gray = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2GRAY)
     
-    # 피부톤 영역
+    # [차단 1] 시커먼 암전 이미지, 빛 번짐 단색 이미지 배제
+    overall_mean = gray.mean()
+    overall_std = gray.std()
+    if overall_mean < 65 or overall_mean > 240 or overall_std < 25:
+        return False
+        
+    # [차단 2] 중심부 사람 피부톤 검증
+    roi_hsv = hsv[int(h * 0.15):int(h * 0.75), int(w * 0.20):int(w * 0.80)]
     lower_skin1 = np.array([0, 25, 50], dtype=np.uint8)
     upper_skin1 = np.array([25, 190, 255], dtype=np.uint8)
     lower_skin2 = np.array([170, 25, 50], dtype=np.uint8)
     upper_skin2 = np.array([180, 190, 255], dtype=np.uint8)
-    
     mask1 = cv2.inRange(roi_hsv, lower_skin1, upper_skin1)
     mask2 = cv2.inRange(roi_hsv, lower_skin2, upper_skin2)
     skin_mask = cv2.bitwise_or(mask1, mask2)
     skin_ratio = np.sum(skin_mask > 0) / (roi_hsv.shape[0] * roi_hsv.shape[1])
-    
-    # 이목구비 윤곽선(Canny) 밀도 검증 (평평한 나무판자 차단)
-    gray_roi = cv2.cvtColor(cropped_img[int(h * 0.15):int(h * 0.75), int(w * 0.20):int(w * 0.80)], cv2.COLOR_BGR2GRAY)
+    if skin_ratio < 0.10:
+        return False
+        
+    # [차단 3] 눈·코·입 등 이목구비 윤곽선 검증 (평평한 나무책상/플라스틱 배제)
+    gray_roi = gray[int(h * 0.15):int(h * 0.75), int(w * 0.20):int(w * 0.80)]
     edges = cv2.Canny(gray_roi, 50, 150)
     edge_count = (edges > 0).sum()
-    
-    # 피부색 비율 10% 이상, 눈코입 윤곽선 150픽셀 이상 동시 충족
-    return (skin_ratio >= 0.10 and edge_count >= 150)
+    if edge_count < 120:
+        return False
+        
+    # [차단 4] 상단 모서리 배경 밝기 (증명사진 상단 배경 최소 밝기 확인)
+    top_corners = np.concatenate([gray[:20, :30].flatten(), gray[:20, -30:].flatten()])
+    if top_corners.mean() < 80:
+        return False
+        
+    return True
 
-def search_candidates_from_contours(all_cnts, img_h, img_w):
-    """윤곽선 리스트에서 증명사진 후보 박스 추출"""
+def extract_all_photos(image):
+    """다단계 적응형 탐색 및 정밀 보정 엔진"""
+    img_h, img_w = image.shape[:2]
     img_area = img_h * img_w
+    
+    # 1. 순수 디지털 원본 파일인지 검사
+    top_b = image[0:5, :, :]
+    bottom_b = image[img_h-5:img_h, :, :]
+    left_b = image[:, 0:5, :]
+    right_b = image[:, img_w-5:img_w, :]
+    border_concat = np.concatenate([top_b.flatten(), bottom_b.flatten(), left_b.flatten(), right_b.flatten()])
+    if np.mean(border_concat) > 140:
+        res = cv2.resize(image, (350, 450), interpolation=cv2.INTER_CUBIC)
+        return [res] if is_actual_portrait_photo(res) else []
+        
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    
+    # 형광등 빛 반사(글레어)에 구애받지 않는 다중 채널 윤곽선 추출
+    _, thresh_bright = cv2.threshold(blur, 130, 255, cv2.THRESH_BINARY)
+    _, thresh_otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thresh_adapt = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 7)
+    edged = cv2.Canny(blur, 35, 120)
+    
+    kernel_e = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    edged_closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel_e)
+    kernel_5 = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    closed_bright = cv2.morphologyEx(thresh_bright, cv2.MORPH_CLOSE, kernel_5, iterations=2)
+    closed_otsu = cv2.morphologyEx(thresh_otsu, cv2.MORPH_CLOSE, kernel_5, iterations=2)
+    closed_adapt = cv2.morphologyEx(thresh_adapt, cv2.MORPH_CLOSE, kernel_5, iterations=2)
+    
+    c1, _ = cv2.findContours(closed_bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    c2, _ = cv2.findContours(closed_otsu, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    c3, _ = cv2.findContours(closed_adapt, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    c4, _ = cv2.findContours(edged_closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    all_cnts = list(c1) + list(c2) + list(c3) + list(c4)
+    
     candidates = []
     for c in all_cnts:
         area = cv2.contourArea(c)
-        if not (img_area * 0.005 < area < img_area * 0.50):
+        if not (img_area * 0.005 < area < img_area * 0.45):
             continue
-            
         rect = cv2.minAreaRect(c)
         (cx, cy), (w, h), angle = rect
         if w == 0 or h == 0:
@@ -171,7 +244,7 @@ def search_candidates_from_contours(all_cnts, img_h, img_w):
         if w > h:
             w, h = h, w
         ar = w / h
-        if not (0.60 < ar < 0.95):
+        if not (0.58 < ar < 0.98):
             continue
             
         quad_pts = get_true_quad(c)
@@ -181,7 +254,7 @@ def search_candidates_from_contours(all_cnts, img_h, img_w):
         
         ratio_diff = min(abs(ar - 0.75), abs(ar - 0.778))
         ratio_score = max(0.0, 1.0 - (ratio_diff / 0.15)) * 50.0
-        score = is_quad * 50.0 + ratio_score + (area / img_area) * 100.0
+        score = is_quad * 50.0 + ratio_score + (area / img_area) * 80.0
         
         candidates.append({
             'pts': quad_pts,
@@ -190,120 +263,37 @@ def search_candidates_from_contours(all_cnts, img_h, img_w):
             'area': area,
             'score': score
         })
-    return candidates
-
-def extract_all_photos(image):
-    """다단계 재검토 및 형광등 반사 자동 극복 엔진"""
-    img_h, img_w = image.shape[:2]
-    
-    # 1. 순수 디지털 원본 파일인지 검사 (가장자리 평균 밝기)
-    top_b = image[0:5, :, :]
-    bottom_b = image[img_h-5:img_h, :, :]
-    left_b = image[:, 0:5, :]
-    right_b = image[:, img_w-5:img_w, :]
-    border_concat = np.concatenate([top_b.flatten(), bottom_b.flatten(), left_b.flatten(), right_b.flatten()])
-    if np.mean(border_concat) > 140:
-        return [cv2.resize(image, (350, 450), interpolation=cv2.INTER_CUBIC)]
         
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    candidates.sort(key=lambda x: x['score'], reverse=True)
+    distinct = []
+    for cand in candidates:
+        cx1, cy1 = cand['center']
+        is_overlap = False
+        for kept in distinct:
+            dist = np.hypot(cx1 - kept['center'][0], cy1 - kept['center'][1])
+            if dist < min(cand['w'], kept['w']) * 0.65:
+                is_overlap = True
+                break
+        if not is_overlap:
+            distinct.append(cand)
+            
+    distinct.sort(key=lambda x: (x['center'][1] // 200, x['center'][0]))
     
     target_w, target_h = 350, 450
     dst = np.array([[0, 0], [target_w-1, 0], [target_w-1, target_h-1], [0, target_h-1]], dtype="float32")
     
-    # ==========================================
-    # [1단계 탐색] 밝기 및 이진화 기반 스캔
-    # ==========================================
-    _, thresh_bright = cv2.threshold(blur, 130, 255, cv2.THRESH_BINARY)
-    _, thresh_otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    closed_bright = cv2.morphologyEx(thresh_bright, cv2.MORPH_CLOSE, kernel, iterations=2)
-    closed_otsu = cv2.morphologyEx(thresh_otsu, cv2.MORPH_CLOSE, kernel, iterations=2)
-    
-    c1, _ = cv2.findContours(closed_bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    c2, _ = cv2.findContours(closed_otsu, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    candidates = search_candidates_from_contours(list(c1) + list(c2), img_h, img_w)
-    
-    # 1단계 후보군 중 실제 인물 사진인지 자가 점검
     verified_photos = []
-    if candidates:
-        candidates.sort(key=lambda x: x['score'], reverse=True)
-        distinct = []
-        for cand in candidates:
-            cx1, cy1 = cand['center']
-            is_overlap = False
-            for kept in distinct:
-                dist = np.hypot(cx1 - kept['center'][0], cy1 - kept['center'][1])
-                if dist < min(cand['w'], kept['w']) * 0.7:
-                    is_overlap = True
-                    break
-            if not is_overlap:
-                distinct.append(cand)
-                
-        for p in distinct:
-            ordered_pts = robust_order_points(p['pts'])
-            M = cv2.getPerspectiveTransform(ordered_pts, dst)
-            warped = cv2.warpPerspective(image, M, (target_w, target_h), flags=cv2.INTER_CUBIC)
-            refined = refine_and_deskew(warped, target_w, target_h)
-            if is_actual_portrait_photo(refined):
-                verified_photos.append(refined)
-
-    # ==========================================
-    # [2단계 재탐색] 1단계 실패 시: 형광등 반사를 분리하는 엣지(Edge) 전면 재스캔
-    # ==========================================
-    if not verified_photos:
-        edged = cv2.Canny(blur, 40, 150)
-        kernel_edge = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        dilated_edge = cv2.dilate(edged, kernel_edge, iterations=1)
-        cnts_edge, _ = cv2.findContours(dilated_edge, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    for p in distinct:
+        ordered_pts = robust_order_points(p['pts'])
+        M = cv2.getPerspectiveTransform(ordered_pts, dst)
+        warped = cv2.warpPerspective(image, M, (target_w, target_h), flags=cv2.INTER_CUBIC)
+        refined = refine_and_deskew(warped, target_w, target_h)
         
-        candidates_edge = search_candidates_from_contours(cnts_edge, img_h, img_w)
-        if candidates_edge:
-            candidates_edge.sort(key=lambda x: x['score'], reverse=True)
-            for p in candidates_edge:
-                ordered_pts = robust_order_points(p['pts'])
-                M = cv2.getPerspectiveTransform(ordered_pts, dst)
-                warped = cv2.warpPerspective(image, M, (target_w, target_h), flags=cv2.INTER_CUBIC)
-                refined = refine_and_deskew(warped, target_w, target_h)
-                if is_actual_portrait_photo(refined):
-                    verified_photos.append(refined)
-                    break
-
-    # ==========================================
-    # [3단계 재탐색] 2단계 실패 시: 피부톤 클러스터 기준 역추적
-    # ==========================================
-    if not verified_photos:
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        lower_skin1 = np.array([0, 25, 50], dtype=np.uint8)
-        upper_skin1 = np.array([25, 190, 255], dtype=np.uint8)
-        mask = cv2.inRange(hsv, lower_skin1, upper_skin1)
-        kernel_skin = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-        mask_clean = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_skin, iterations=3)
-        cnts_skin, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        for cs in cnts_skin:
-            if cv2.contourArea(cs) > 2000:
-                rect_s = cv2.minAreaRect(cs)
-                scx, scy = rect_s[0]
-                sw, sh = rect_s[1]
-                # 얼굴 크기 기준 추정 마진 (3.5x4.5 비율)
-                box_h = int(max(sw, sh) * 2.3)
-                box_w = int(box_h * 0.77)
-                y1 = max(0, int(scy - box_h * 0.45))
-                y2 = min(img_h, int(y1 + box_h))
-                x1 = max(0, int(scx - box_w * 0.5))
-                x2 = min(img_w, int(x1 + box_w))
-                
-                face_sub = image[y1:y2, x1:x2]
-                if face_sub.shape[0] > 50 and face_sub.shape[1] > 50:
-                    cand_img = cv2.resize(face_sub, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
-                    cand_refined = refine_and_deskew(cand_img, target_w, target_h)
-                    if is_actual_portrait_photo(cand_refined):
-                        verified_photos.append(cand_refined)
-                        break
-                        
-    # 최종적으로도 증명사진이 아니면 빈 리스트 반환 (책상 전체 전송 차단)
+        # [핵심] 철저한 최종 검증을 통과한 진짜 증명사진만 담음!
+        if is_actual_portrait_photo(refined):
+            verified_photos.append(refined)
+            
+    # [핵심] 검증에 통과한 사진이 없으면 절대로 찌꺼기를 내보내지 않고 빈 리스트 반환!
     return verified_photos
 
 def upload_via_gas(file_bytes, file_name, gas_url):
@@ -328,17 +318,17 @@ if st.button("사진 제출 및 자동 스캔 완료", type="primary"):
     elif not uploaded_file:
         st.warning("⚠️ 증명사진 파일을 업로드해주세요!")
     else:
-        with st.spinner("사진을 정밀 분석하고 자동 보정 스캔 중입니다..."):
+        with st.spinner("사진을 분석하고 정밀 스캔 중입니다..."):
             try:
                 file_bytes = np.frombuffer(uploaded_file.read(), np.uint8)
                 image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
                 
-                # 다단계 재검토 추출 엔진 실행
+                # 정밀 추출 및 검증 엔진 실행
                 processed_photos = extract_all_photos(image)
                 
-                # [게이트키퍼] 진짜 증명사진으로 검증되지 않은 경우 전송 차단
+                # [게이트키퍼] 진짜 증명사진 판정이 안 나면 절대 드라이브 전송하지 않고 에러 출력!
                 if not processed_photos:
-                    st.error("🚨 **증명사진 영역을 감지하지 못했습니다!**\n\n형광등 빛 반사가 심하거나 사진이 너무 멀리 떨어져 있습니다. **빛 반사가 없는 곳에서 사진을 조금 더 가까이 촬영하여 다시 업로드해 주세요.**")
+                    st.error("🚨 **사진 속에서 규격에 맞는 증명사진을 찾을 수 없습니다!**\n\n- 형광등 빛 반사가 없는 곳에서 증명사진이 잘 보이도록 조금 더 가까이 촬영해 주세요.\n- 증명사진이 바르게 놓여 있는지 확인 후 다시 업로드해 주세요.")
                 else:
                     uploaded_names = []
                     for idx, photo in enumerate(processed_photos):
