@@ -9,6 +9,14 @@ import requests
 # 페이지 설정
 st.set_page_config(page_title="증명사진 수집 시스템", page_icon="📸")
 
+# 세션 상태 초기화 (다중 사진 선택 및 완료 상태 유지용)
+if "candidates" not in st.session_state:
+    st.session_state["candidates"] = None
+if "student_meta" not in st.session_state:
+    st.session_state["student_meta"] = ("", "")
+if "upload_result" not in st.session_state:
+    st.session_state["upload_result"] = None
+
 # 1. URL 주소에서 선생님 고유 코드(?t=...) 자동 인식 (Secrets 백업 호환)
 current_code = st.query_params.get("t", "")
 target_gas_url = ""
@@ -58,12 +66,10 @@ def robust_order_points(pts):
     """45도 이상 크게 기울어진 사진도 짧은 변(위/아래)과 긴 변(좌/우)을 구분하여 [좌상, 우상, 우하, 좌하]로 정확히 정렬"""
     pts = np.array(pts, dtype="float32").reshape(4, 2)
     
-    # 1. 중심점 기준 시계 방향(Clockwise)으로 4개 꼭짓점 정렬
     center = np.mean(pts, axis=0)
     angles = np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0])
     poly = pts[np.argsort(angles)]
     
-    # 2. 마주 보는 두 쌍의 변 길이 측정
     l0 = np.linalg.norm(poly[0] - poly[1])
     l1 = np.linalg.norm(poly[1] - poly[2])
     l2 = np.linalg.norm(poly[2] - poly[3])
@@ -72,15 +78,13 @@ def robust_order_points(pts):
     mean_02 = (l0 + l2) / 2.0
     mean_13 = (l1 + l3) / 2.0
     
-    # 3. 더 짧은 변의 쌍을 윗변/아랫변 후보로 선택 (세로형 증명사진/폴라로이드 규격 보장)
     if mean_02 <= mean_13:
-        cand_a = poly                      # P0->P1이 윗변인 경우
-        cand_b = np.roll(poly, -2, axis=0) # P2->P3가 윗변인 경우
+        cand_a = poly
+        cand_b = np.roll(poly, -2, axis=0)
     else:
-        cand_a = np.roll(poly, -1, axis=0) # P1->P2가 윗변인 경우
-        cand_b = np.roll(poly, -3, axis=0) # P3->P0가 윗변인 경우
+        cand_a = np.roll(poly, -1, axis=0)
+        cand_b = np.roll(poly, -3, axis=0)
         
-    # 4. 두 짧은 변 중 화면상 더 위쪽(Y좌표 평균이 더 작은 쪽)을 윗변(좌상->우상)으로 확정
     top_y_a = (cand_a[0][1] + cand_a[1][1]) / 2.0
     top_y_b = (cand_b[0][1] + cand_b[1][1]) / 2.0
     
@@ -141,13 +145,11 @@ def is_actual_portrait_photo(cropped_img):
     hsv = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2GRAY)
     
-    # [차단 1] 시커먼 암전 이미지, 극단적 단색 배제
     overall_mean = gray.mean()
     overall_std = gray.std()
     if overall_mean < 65 or overall_mean > 240 or overall_std < 22:
         return False
         
-    # [차단 2] 중심부 사람 피부톤 검증
     roi_hsv = hsv[int(h * 0.15):int(h * 0.75), int(w * 0.20):int(w * 0.80)]
     lower_skin1 = np.array([0, 25, 50], dtype=np.uint8)
     upper_skin1 = np.array([25, 190, 255], dtype=np.uint8)
@@ -160,7 +162,6 @@ def is_actual_portrait_photo(cropped_img):
     if skin_ratio < 0.08:
         return False
         
-    # [차단 3] 눈·코·입 등 이목구비 윤곽선 검증 (평평한 나무책상/플라스틱 배제)
     gray_roi = gray[int(h * 0.15):int(h * 0.75), int(w * 0.20):int(w * 0.80)]
     edges = cv2.Canny(gray_roi, 50, 150)
     edge_count = (edges > 0).sum()
@@ -250,7 +251,6 @@ def extract_all_photos(image):
         if not is_overlap:
             distinct.append(cand)
             
-    # 좌상단부터 순서대로 정렬
     distinct.sort(key=lambda x: (x['center'][1] // 200, x['center'][0]))
     
     target_w, target_h = 350, 450
@@ -263,7 +263,6 @@ def extract_all_photos(image):
         warped = cv2.warpPerspective(image, M, (target_w, target_h), flags=cv2.INTER_CUBIC)
         refined = refine_and_deskew(warped, target_w, target_h)
         
-        # [철저한 검증] 증명사진으로 완벽히 판정된 사진만 최종 통과
         if is_actual_portrait_photo(refined):
             verified_photos.append(refined)
             
@@ -282,8 +281,11 @@ def upload_via_gas(file_bytes, file_name, gas_url):
     if result.get("status") != "success":
         raise Exception(result.get("message", "알 수 없는 전송 오류"))
 
-# 제출 버튼
+# 1차 스캔 및 제출 버튼
 if st.button("사진 제출 및 자동 스캔 완료", type="primary"):
+    st.session_state["candidates"] = None
+    st.session_state["upload_result"] = None
+    
     if not target_gas_url:
         st.error("🚨 담임 선생님의 구글 드라이브 연결 정보가 없습니다! 담임 선생님께서 공유해주신 전용 링크로 다시 접속해주세요.")
     elif not student_id or not student_name:
@@ -296,39 +298,60 @@ if st.button("사진 제출 및 자동 스캔 완료", type="primary"):
                 file_bytes = np.frombuffer(uploaded_file.read(), np.uint8)
                 image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
                 
-                # 정밀 추출 및 검증 엔진 실행
                 processed_photos = extract_all_photos(image)
                 
-                # [게이트키퍼] 진짜 증명사진 판정이 안 나면 절대 드라이브 전송하지 않고 에러 출력!
+                # [경우 1] 증명사진이 감지되지 않은 경우 -> 전송 차단 및 재촬영 안내
                 if not processed_photos:
                     st.error("🚨 **사진 속에서 규격에 맞는 증명사진을 감지하지 못했습니다!**\n\n- 빛 반사가 심하거나 증명사진이 너무 작게 찍혔습니다.\n- 사진이 잘 보이도록 조금 더 가까이 촬영한 후 다시 업로드해 주세요.")
-                else:
-                    uploaded_names = []
-                    for idx, photo in enumerate(processed_photos):
-                        is_success, buffer = cv2.imencode(".jpg", photo)
-                        if not is_success:
-                            continue
-                            
-                        if len(processed_photos) == 1:
-                            f_name = f"{student_id}_{student_name}.jpg"
-                        else:
-                            f_name = f"{student_id}_{student_name}({idx + 1}).jpg"
-                            
+                
+                # [경우 2] 증명사진이 딱 1장 감지된 경우 -> 즉시 업로드 완료
+                elif len(processed_photos) == 1:
+                    photo = processed_photos[0]
+                    is_success, buffer = cv2.imencode(".jpg", photo)
+                    if is_success:
+                        f_name = f"{student_id.strip()}_{student_name.strip()}.jpg"
                         upload_via_gas(buffer.tobytes(), f_name, target_gas_url)
-                        uploaded_names.append((f_name, photo))
-                    
-                    if uploaded_names:
-                        st.success(f"🎉 [{student_id} {student_name}] 학생의 증명사진 {len(uploaded_names)}장이 성공적으로 추출 및 저장되었습니다!")
-                        
-                        cols = st.columns(len(uploaded_names))
-                        for col, (f_name, p_img) in zip(cols, uploaded_names):
-                            with col:
-                                st.image(p_img, channels="BGR", caption=f"저장 완료: {f_name}")
+                        st.session_state["upload_result"] = (f_name, photo)
                     else:
-                        st.error("사진 변환 및 업로드에 실패했습니다.")
-                        
+                        st.error("이미지 변환 중 오류가 발생했습니다.")
+                
+                # [경우 3] 사진이 2장 이상 감지된 경우 -> 학생 선택 모드 활성화
+                else:
+                    st.session_state["candidates"] = processed_photos
+                    st.session_state["student_meta"] = (student_id.strip(), student_name.strip())
+                    
             except Exception as e:
                 st.error(f"처리 중 오류가 발생했습니다: {e}")
+
+# 다중 사진 감지 시: 학생이 제출할 사진 1장을 선택하는 UI
+if st.session_state["candidates"] is not None:
+    cands = st.session_state["candidates"]
+    s_id, s_name = st.session_state["student_meta"]
+    
+    st.warning(f"🧐 **사진 속에서 총 {len(cands)}장의 인물 사진이 감지되었습니다!**\n\n아래 사진 중 선생님께 제출할 **본인의 증명사진 1장**을 선택해 주세요.")
+    
+    cols = st.columns(len(cands))
+    for idx, (col, p_img) in enumerate(zip(cols, cands)):
+        with col:
+            st.image(p_img, channels="BGR", caption=f"감지된 사진 {idx + 1}")
+            if st.button(f"✅ {idx + 1}번 사진으로 제출", key=f"sel_btn_{idx}", type="primary", use_container_width=True):
+                with st.spinner("선택한 증명사진을 선생님 클라우드에 저장 중입니다..."):
+                    try:
+                        is_success, buffer = cv2.imencode(".jpg", p_img)
+                        if is_success:
+                            f_name = f"{s_id}_{s_name}.jpg"
+                            upload_via_gas(buffer.tobytes(), f_name, target_gas_url)
+                            st.session_state["upload_result"] = (f_name, p_img)
+                            st.session_state["candidates"] = None
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"전송 중 오류가 발생했습니다: {e}")
+
+# 최종 업로드 완료 화면 표시
+if st.session_state["upload_result"] is not None:
+    f_name, final_img = st.session_state["upload_result"]
+    st.success(f"🎉 **[{f_name}]** 증명사진이 성공적으로 제출 및 자동 보정되었습니다!")
+    st.image(final_img, channels="BGR", caption=f"선생님 드라이브에 저장된 최종 보정 사진 ({f_name})", width=280)
 
 # 학생 화면 하단 관리자 복귀 링크
 if current_code and not st.session_state.get("is_teacher_creator", False):
