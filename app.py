@@ -55,19 +55,39 @@ with col2:
 uploaded_file = st.file_uploader("증명사진 파일 업로드 (스마트폰 촬영 또는 파일 선택)", type=['jpg', 'jpeg', 'png', 'JPG', 'JPEG', 'PNG'])
 
 def robust_order_points(pts):
-    """카메라 촬영 기준에 맞추어 4개 꼭짓점을 [좌상, 우상, 우하, 좌하]로 정확히 매핑"""
+    """45도 이상 크게 기울어진 사진도 짧은 변(위/아래)과 긴 변(좌/우)을 구분하여 [좌상, 우상, 우하, 좌하]로 정확히 정렬"""
     pts = np.array(pts, dtype="float32").reshape(4, 2)
-    x_sorted = pts[np.argsort(pts[:, 0]), :]
-    left_most = x_sorted[:2, :]
-    right_most = x_sorted[2:, :]
-
-    left_most = left_most[np.argsort(left_most[:, 1]), :]
-    tl, bl = left_most
-
-    right_most = right_most[np.argsort(right_most[:, 1]), :]
-    tr, br = right_most
-
-    return np.array([tl, tr, br, bl], dtype="float32")
+    
+    # 1. 중심점 기준 시계 방향(Clockwise)으로 4개 꼭짓점 정렬
+    center = np.mean(pts, axis=0)
+    angles = np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0])
+    poly = pts[np.argsort(angles)]
+    
+    # 2. 마주 보는 두 쌍의 변 길이 측정
+    l0 = np.linalg.norm(poly[0] - poly[1])
+    l1 = np.linalg.norm(poly[1] - poly[2])
+    l2 = np.linalg.norm(poly[2] - poly[3])
+    l3 = np.linalg.norm(poly[3] - poly[0])
+    
+    mean_02 = (l0 + l2) / 2.0
+    mean_13 = (l1 + l3) / 2.0
+    
+    # 3. 더 짧은 변의 쌍을 윗변/아랫변 후보로 선택 (세로형 증명사진/폴라로이드 규격 보장)
+    if mean_02 <= mean_13:
+        cand_a = poly                      # P0->P1이 윗변인 경우
+        cand_b = np.roll(poly, -2, axis=0) # P2->P3가 윗변인 경우
+    else:
+        cand_a = np.roll(poly, -1, axis=0) # P1->P2가 윗변인 경우
+        cand_b = np.roll(poly, -3, axis=0) # P3->P0가 윗변인 경우
+        
+    # 4. 두 짧은 변 중 화면상 더 위쪽(Y좌표 평균이 더 작은 쪽)을 윗변(좌상->우상)으로 확정
+    top_y_a = (cand_a[0][1] + cand_a[1][1]) / 2.0
+    top_y_b = (cand_b[0][1] + cand_b[1][1]) / 2.0
+    
+    if top_y_a <= top_y_b:
+        return cand_a.astype("float32")
+    else:
+        return cand_b.astype("float32")
 
 def get_true_quad(contour):
     """인화지의 실제 4개 모서리 꼭짓점 검출"""
@@ -81,7 +101,7 @@ def get_true_quad(contour):
     return cv2.boxPoints(rect).astype("float32")
 
 def refine_and_deskew(warped, target_w=350, target_h=450):
-    """미세한 기울기(각도 오차)만 수평 0도로 정밀 보정 (상하반전 금지)"""
+    """미세한 기울기(각도 오차)만 수평 0도로 정밀 보정"""
     if warped.shape[0] != target_h or warped.shape[1] != target_w:
         warped = cv2.resize(warped, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
         
@@ -105,14 +125,12 @@ def refine_and_deskew(warped, target_w=350, target_h=450):
                 elif abs(abs(deg) - 90) < 12:
                     angles.append(deg - 90 if deg > 0 else deg + 90)
                 
-    # 5도 이내의 미세 회전 오차만 정밀 평행 보정
     if len(angles) >= 2:
         tilt = float(np.median(angles))
         if 0.25 <= abs(tilt) < 5.0:
             rot_M = cv2.getRotationMatrix2D((target_w / 2.0, target_h / 2.0), tilt, 1.0)
             warped = cv2.warpAffine(warped, rot_M, (target_w, target_h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
             
-    # 외곽 바닥면 잔상 정리 (2px 안전 마진)
     trim = 2
     final = warped[trim:target_h-trim, trim:target_w-trim]
     return cv2.resize(final, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
@@ -169,7 +187,6 @@ def extract_all_photos(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     
-    # 조명/그림자에 구애받지 않는 다중 채널 윤곽선 추출
     _, thresh_bright = cv2.threshold(blur, 130, 255, cv2.THRESH_BINARY)
     _, thresh_otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     thresh_adapt = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 7)
@@ -250,7 +267,6 @@ def extract_all_photos(image):
         if is_actual_portrait_photo(refined):
             verified_photos.append(refined)
             
-    # 통과한 사진이 없으면 절대로 잔상/잡동사니를 내보내지 않고 빈 리스트 반환
     return verified_photos
 
 def upload_via_gas(file_bytes, file_name, gas_url):
