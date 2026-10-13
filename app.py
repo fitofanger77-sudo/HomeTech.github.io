@@ -63,7 +63,7 @@ with col2:
 uploaded_file = st.file_uploader("증명사진 파일 업로드 (스마트폰 촬영 또는 파일 선택)", type=['jpg', 'jpeg', 'png', 'JPG', 'JPEG', 'PNG'])
 
 def robust_order_points(pts):
-    """45도 이상 크게 기울어진 사진도 짧은 변(위/아래)과 긴 변(좌/우)을 구분하여 [좌상, 우상, 우하, 좌하]로 정확히 정렬"""
+    """45도 이상 기울어진 사진도 짧은 변(위/아래)과 긴 변(좌/우)을 구분하여 [좌상, 우상, 우하, 좌하]로 정확히 정렬"""
     pts = np.array(pts, dtype="float32").reshape(4, 2)
     
     center = np.mean(pts, axis=0)
@@ -93,21 +93,243 @@ def robust_order_points(pts):
     else:
         return cand_b.astype("float32")
 
-def get_true_quad(contour):
-    """인화지의 실제 4개 모서리 꼭짓점 검출"""
+def regularize_quad(pts):
+    """형광등 빛 반사 등으로 1개 모서리가 바깥으로 튀었을 때, 반대쪽 직각(90도) 모서리 3개를 기준으로 직사각형 복원"""
+    ordered = robust_order_points(pts)
+    
+    # 4개 꼭짓점의 내각 및 변의 길이 계산
+    angles = []
+    edges = []
+    for i in range(4):
+        p_curr = ordered[i]
+        p_prev = ordered[(i - 1) % 4]
+        p_next = ordered[(i + 1) % 4]
+        
+        v1 = p_prev - p_curr
+        v2 = p_next - p_curr
+        n1 = np.linalg.norm(v1)
+        n2 = np.linalg.norm(v2)
+        edges.append(n2)
+        if n1 == 0 or n2 == 0:
+            angles.append(0.0)
+        else:
+            cos_th = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
+            angles.append(np.degrees(np.arccos(cos_th)))
+            
+    w_top, h_right, w_bot, h_left = edges[0], edges[1], edges[2], edges[3]
+    w_diff = abs(w_top - w_bot) / max(w_top, w_bot, 1.0)
+    h_diff = abs(h_left - h_right) / max(h_left, h_right, 1.0)
+    
+    # 마주 보는 변의 길이가 8% 이상 차이 나면 한쪽 모서리가 빛 반사/그림자로 왜곡된 상태
+    if w_diff > 0.08 or h_diff > 0.08:
+        # 각 꼭짓점의 인접 두 변 길이 합 비교 (튀어나간 꼭짓점은 인접 변의 합이 비정상적으로 큼)
+        adj_sums = [edges[i] + edges[(i - 1) % 4] for i in range(4)]
+        for k in range(4):
+            opp = (k + 2) % 4
+            # 반대쪽 모서리가 직각(82~98도)에 가깝고, 현재 모서리 k가 비정상적으로 길게 뻗어 나간 경우
+            if 82.0 <= angles[opp] <= 98.0 and adj_sums[k] > adj_sums[opp] * 1.08:
+                fixed = ordered.copy()
+                fixed[k] = ordered[(k + 1) % 4] + ordered[(k + 3) % 4] - ordered[opp]
+                return robust_order_points(fixed)
+                
+    return ordered
+
+def get_true_quads(contour):
+    """인화지의 4개 모서리 후보(원본 다각형 + 직사각형 복원본 + 최소외접사각형) 추출"""
     hull = cv2.convexHull(contour)
     peri = cv2.arcLength(hull, True)
-    for eps in [0.03, 0.04, 0.02, 0.05, 0.015]:
+    quads = []
+    
+    for eps in [0.02, 0.03, 0.04, 0.05]:
         approx = cv2.approxPolyDP(hull, eps * peri, True)
         if len(approx) == 4 and cv2.isContourConvex(approx):
-            return approx.reshape(4, 2).astype("float32")
+            raw_q = approx.reshape(4, 2).astype("float32")
+            quads.append(regularize_quad(raw_q))
+            break
+            
     rect = cv2.minAreaRect(hull)
-    return cv2.boxPoints(rect).astype("float32")
+    quads.append(robust_order_points(cv2.boxPoints(rect).astype("float32")))
+    return quads
+
+def fit_border_line_x_of_y(pts_list, default_x):
+    """좌/우 세로 경계 점들로부터 x = a*y + b 직선 피팅 (이상치 제거)"""
+    if len(pts_list) < 12:
+        return 0.0, float(default_x)
+    pts_arr = np.array(pts_list, dtype="float32")
+    vx, vy, x0, y0 = cv2.fitLine(pts_arr, cv2.DIST_L1, 0, 0.01, 0.01).flatten()
+    if abs(vy) < 1e-4:
+        return 0.0, float(default_x)
+    a = float(vx / vy)
+    b = float(x0 - a * y0)
+    # 기울기가 25도 이상 극단적으로 꺾인 직선은 무시
+    if abs(a) > 0.45:
+        return 0.0, float(np.median(pts_arr[:, 0]))
+    return a, b
+
+def fit_border_line_y_of_x(pts_list, default_y):
+    """상/하 가로 경계 점들로부터 y = a*x + b 직선 피팅 (이상치 제거)"""
+    if len(pts_list) < 12:
+        return 0.0, float(default_y)
+    pts_arr = np.array(pts_list, dtype="float32")
+    vx, vy, x0, y0 = cv2.fitLine(pts_arr, cv2.DIST_L1, 0, 0.01, 0.01).flatten()
+    if abs(vx) < 1e-4:
+        return 0.0, float(default_y)
+    a = float(vy / vx)
+    b = float(y0 - a * x0)
+    if abs(a) > 0.45:
+        return 0.0, float(np.median(pts_arr[:, 1]))
+    return a, b
+
+def intersect_lines(a_x, b_x, a_y, b_y):
+    """세로선(x = a_x*y + b_x)과 가로선(y = a_y*x + b_y)의 교점 계산"""
+    denom = 1.0 - a_x * a_y
+    if abs(denom) < 1e-5:
+        return b_x, b_y
+    x = (a_x * b_y + b_x) / denom
+    y = a_y * x + b_y
+    return x, y
+
+def refine_quad_in_warped(warped, target_w=350, target_h=450):
+    """1차 스캔된 이미지 내부에서 실제 인화지 4변을 다시 찾아 빈틈없이 꽉 채우도록 재투영"""
+    lab = cv2.cvtColor(warped, cv2.COLOR_BGR2LAB).astype("float32")
+    hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV).astype("float32")
+    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY).astype("float32")
+    
+    # 사진 내부의 밝은 배경(인화지 여백/스튜디오 배경) 기준 색상 측정
+    # 상단 좌/우 배경 영역에서 밝고 채도가 낮은 픽셀 샘플링
+    bg_zone_gray = np.concatenate([
+        gray[35:180, 45:105].flatten(),
+        gray[35:180, target_w-105:target_w-45].flatten()
+    ])
+    bg_thresh = np.percentile(bg_zone_gray, 70)
+    
+    # 인화지/스튜디오 배경 판별 기준: 충분히 밝고 나무 책상처럼 채도가 높지 않은 영역
+    is_paper = (gray >= max(135.0, bg_thresh - 35.0)) & (hsv[:, :, 1] < 55.0)
+    
+    # 1. 좌측 경계 탐색 (안쪽 배경 x=95 에서 바깥쪽 x=0 방향으로 스캔)
+    left_pts = []
+    for y in range(45, int(target_h * 0.72), 3):
+        # 안쪽에서 인화지 배경 시작점 찾기
+        start_x = -1
+        for x in range(105, 15, -1):
+            if is_paper[y, x]:
+                start_x = x
+                break
+        if start_x != -1:
+            edge_x = 0
+            ref_l, ref_a, ref_b = lab[y, start_x]
+            for x in range(start_x, 1, -1):
+                # 바깥쪽 픽셀과의 색상/밝기 차이 계산
+                dl = abs(lab[y, x - 1, 0] - ref_l)
+                da = abs(lab[y, x - 1, 1] - ref_a)
+                db = abs(lab[y, x - 1, 2] - ref_b)
+                color_dist = np.sqrt(dl*dl + da*da + db*db)
+                if (color_dist > 18.0 and not is_paper[y, x - 1]) or gray[y, x - 1] < 115.0:
+                    edge_x = x
+                    break
+            left_pts.append([edge_x, y])
+            
+    # 2. 우측 경계 탐색 (안쪽 배경에서 바깥쪽 x=target_w-1 방향으로 스캔)
+    right_pts = []
+    for y in range(45, int(target_h * 0.72), 3):
+        start_x = -1
+        for x in range(target_w - 105, target_w - 15):
+            if is_paper[y, x]:
+                start_x = x
+                break
+        if start_x != -1:
+            edge_x = target_w - 1
+            ref_l, ref_a, ref_b = lab[y, start_x]
+            for x in range(start_x, target_w - 2):
+                dl = abs(lab[y, x + 1, 0] - ref_l)
+                da = abs(lab[y, x + 1, 1] - ref_a)
+                db = abs(lab[y, x + 1, 2] - ref_b)
+                color_dist = np.sqrt(dl*dl + da*da + db*db)
+                if (color_dist > 18.0 and not is_paper[y, x + 1]) or gray[y, x + 1] < 115.0:
+                    edge_x = x
+                    break
+            right_pts.append([edge_x, y])
+            
+    # 3. 상단 경계 탐색 (안쪽 y=80 에서 위쪽 y=0 방향으로 스캔)
+    top_pts = []
+    for x in range(45, target_w - 45, 3):
+        start_y = -1
+        for y in range(85, 10, -1):
+            if is_paper[y, x]:
+                start_y = y
+                break
+        if start_y != -1:
+            edge_y = 0
+            ref_l, ref_a, ref_b = lab[start_y, x]
+            for y in range(start_y, 1, -1):
+                dl = abs(lab[y - 1, x, 0] - ref_l)
+                da = abs(lab[y - 1, x, 1] - ref_a)
+                db = abs(lab[y - 1, x, 2] - ref_b)
+                color_dist = np.sqrt(dl*dl + da*da + db*db)
+                if (color_dist > 18.0 and not is_paper[y - 1, x]) or gray[y - 1, x] < 115.0:
+                    edge_y = y
+                    break
+            top_pts.append([x, edge_y])
+            
+    # 4. 하단 경계 탐색 (하단 외곽 여백/경계 스캔)
+    bot_pts = []
+    for x in range(35, target_w - 35, 3):
+        edge_y = target_h - 1
+        # 하단 끝에서 위로 올라가며 어두운 갈색 책상/서랍 바닥(채도 높거나 중간 밝기)이 끝나는 지점 확인
+        for y in range(target_h - 1, target_h - 45, -1):
+            # 책상/서랍 바닥 특징: 인화지(흰색)도 아니고 검은 정장(매우 어두움, gray < 55)도 아닌 배경
+            is_bg_wedge = (60.0 < gray[y, x] < 155.0) and (hsv[y, x, 1] > 25.0)
+            if is_bg_wedge:
+                edge_y = y - 1
+            else:
+                break
+        bot_pts.append([x, edge_y])
+        
+    a_L, b_L = fit_border_line_x_of_y(left_pts, 0)
+    a_R, b_R = fit_border_line_x_of_y(right_pts, target_w - 1)
+    a_T, b_T = fit_border_line_y_of_x(top_pts, 0)
+    a_B, b_B = fit_border_line_y_of_x(bot_pts, target_h - 1)
+    
+    tl_x, tl_y = intersect_lines(a_L, b_L, a_T, b_T)
+    tr_x, tr_y = intersect_lines(a_R, b_R, a_T, b_T)
+    br_x, br_y = intersect_lines(a_R, b_R, a_B, b_B)
+    bl_x, bl_y = intersect_lines(a_L, b_L, a_B, b_B)
+    
+    # 과도한 축소 방지 (최대 30% 이내 범위로 안전 클램핑)
+    tl_x = np.clip(tl_x, 0, target_w * 0.30)
+    tl_y = np.clip(tl_y, 0, target_h * 0.25)
+    tr_x = np.clip(tr_x, target_w * 0.70, target_w - 1)
+    tr_y = np.clip(tr_y, 0, target_h * 0.25)
+    br_x = np.clip(br_x, target_w * 0.70, target_w - 1)
+    br_y = np.clip(br_y, target_h * 0.75, target_h - 1)
+    bl_x = np.clip(bl_x, 0, target_w * 0.30)
+    bl_y = np.clip(bl_y, target_h * 0.75, target_h - 1)
+    
+    src_quad = np.array([
+        [tl_x, tl_y],
+        [tr_x, tr_y],
+        [br_x, br_y],
+        [bl_x, bl_y]
+    ], dtype="float32")
+    
+    dst_quad = np.array([
+        [0, 0],
+        [target_w - 1, 0],
+        [target_w - 1, target_h - 1],
+        [0, target_h - 1]
+    ], dtype="float32")
+    
+    M = cv2.getPerspectiveTransform(src_quad, dst_quad)
+    return cv2.warpPerspective(warped, M, (target_w, target_h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
 def refine_and_deskew(warped, target_w=350, target_h=450):
-    """미세한 기울기(각도 오차)만 수평 0도로 정밀 보정"""
+    """2단계 자가 점검: 내부 4변 재투영(2회 반복) 후 미세 수평 보정"""
     if warped.shape[0] != target_h or warped.shape[1] != target_w:
         warped = cv2.resize(warped, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
+        
+    # [핵심] 사다리꼴 여백 및 책상/서랍 침범 영역을 2회 반복 추적하여 캔버스에 100% 꽉 채움
+    for _ in range(2):
+        warped = refine_quad_in_warped(warped, target_w, target_h)
         
     gray_w = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray_w, 40, 120)
@@ -120,13 +342,13 @@ def refine_and_deskew(warped, target_w=350, target_h=450):
             if len(line_arr) >= 4:
                 x1, y1, x2, y2 = line_arr[:4]
                 deg = np.degrees(np.arctan2(y2 - y1, x2 - x1))
-                if abs(deg) < 12:
+                if abs(deg) < 10:
                     angles.append(deg)
-                elif abs(deg - 180) < 12:
+                elif abs(deg - 180) < 10:
                     angles.append(deg - 180)
-                elif abs(deg + 180) < 12:
+                elif abs(deg + 180) < 10:
                     angles.append(deg + 180)
-                elif abs(abs(deg) - 90) < 12:
+                elif abs(abs(deg) - 90) < 10:
                     angles.append(deg - 90 if deg > 0 else deg + 90)
                 
     if len(angles) >= 2:
@@ -135,9 +357,26 @@ def refine_and_deskew(warped, target_w=350, target_h=450):
             rot_M = cv2.getRotationMatrix2D((target_w / 2.0, target_h / 2.0), tilt, 1.0)
             warped = cv2.warpAffine(warped, rot_M, (target_w, target_h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
             
-    trim = 2
+    trim = 3
     final = warped[trim:target_h-trim, trim:target_w-trim]
     return cv2.resize(final, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
+
+def score_photo_quality(cropped_img):
+    """보정된 이미지가 얼마나 빈틈없이 반듯한 증명사진인지 품질 점수 계산"""
+    h, w = cropped_img.shape[:2]
+    hsv = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2GRAY)
+    
+    # 좌상단과 우상단 모서리의 배경 대칭성 (책상 침범이 없을수록 좌우 모서리 밝기/채도가 일치함)
+    tl_patch = gray[5:35, 5:35]
+    tr_patch = gray[5:35, w-35:w-5]
+    symmetry_penalty = abs(float(tl_patch.mean()) - float(tr_patch.mean()))
+    
+    # 상단 모서리 평균 밝기 (증명사진 배경은 밝고 채도가 낮음)
+    corner_bright = (float(tl_patch.mean()) + float(tr_patch.mean())) / 2.0
+    corner_sat = (float(hsv[5:35, 5:35, 1].mean()) + float(hsv[5:35, w-35:w-5, 1].mean())) / 2.0
+    
+    return corner_bright - symmetry_penalty * 1.5 - corner_sat * 0.8
 
 def is_actual_portrait_photo(cropped_img):
     """엄격한 증명사진 최종 자가 검증 (피부톤 + 이목구비 + 명암)"""
@@ -171,7 +410,7 @@ def is_actual_portrait_photo(cropped_img):
     return True
 
 def extract_all_photos(image):
-    """다단계 적응형 탐색 및 정밀 보정 엔진"""
+    """다단계 적응형 탐색 및 4변 직선 피팅 정밀 보정 엔진"""
     img_h, img_w = image.shape[:2]
     img_area = img_h * img_w
     
@@ -187,8 +426,12 @@ def extract_all_photos(image):
         
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    hsv_full = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     
-    _, thresh_bright = cv2.threshold(blur, 130, 255, cv2.THRESH_BINARY)
+    # 나무 책상(고채도)과 흰색 인화지(저채도·고명도)를 완벽 분리하는 전용 마스크 추가
+    paper_hsv_mask = cv2.inRange(hsv_full, np.array([0, 0, 145], dtype=np.uint8), np.array([180, 52, 255], dtype=np.uint8))
+    _, thresh_bright = cv2.threshold(blur, 135, 255, cv2.THRESH_BINARY)
+    _, thresh_high = cv2.threshold(blur, 165, 255, cv2.THRESH_BINARY)
     _, thresh_otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     thresh_adapt = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 7)
     edged = cv2.Canny(blur, 35, 120)
@@ -196,16 +439,21 @@ def extract_all_photos(image):
     kernel_e = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     edged_closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel_e)
     kernel_5 = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    
+    closed_paper = cv2.morphologyEx(paper_hsv_mask, cv2.MORPH_CLOSE, kernel_5, iterations=2)
     closed_bright = cv2.morphologyEx(thresh_bright, cv2.MORPH_CLOSE, kernel_5, iterations=2)
+    closed_high = cv2.morphologyEx(thresh_high, cv2.MORPH_CLOSE, kernel_5, iterations=2)
     closed_otsu = cv2.morphologyEx(thresh_otsu, cv2.MORPH_CLOSE, kernel_5, iterations=2)
     closed_adapt = cv2.morphologyEx(thresh_adapt, cv2.MORPH_CLOSE, kernel_5, iterations=2)
     
-    c1, _ = cv2.findContours(closed_bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    c2, _ = cv2.findContours(closed_otsu, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    c3, _ = cv2.findContours(closed_adapt, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    c4, _ = cv2.findContours(edged_closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    all_cnts = list(c1) + list(c2) + list(c3) + list(c4)
-    
+    all_cnts = []
+    for m_img in [closed_paper, closed_bright, closed_high, closed_otsu]:
+        cnts, _ = cv2.findContours(m_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        all_cnts.extend(cnts)
+    for m_img in [closed_adapt, edged_closed]:
+        cnts, _ = cv2.findContours(m_img, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        all_cnts.extend(cnts)
+        
     candidates = []
     for c in all_cnts:
         area = cv2.contourArea(c)
@@ -221,50 +469,67 @@ def extract_all_photos(image):
         if not (0.58 < ar < 0.98):
             continue
             
-        quad_pts = get_true_quad(c)
+        quad_list = get_true_quads(c)
         peri = cv2.arcLength(cv2.convexHull(c), True)
         approx = cv2.approxPolyDP(cv2.convexHull(c), 0.03 * peri, True)
         is_quad = 1.0 if len(approx) == 4 else 0.0
         
         ratio_diff = min(abs(ar - 0.75), abs(ar - 0.778))
         ratio_score = max(0.0, 1.0 - (ratio_diff / 0.15)) * 50.0
-        score = is_quad * 50.0 + ratio_score + (area / img_area) * 80.0
+        base_score = is_quad * 50.0 + ratio_score + (area / img_area) * 80.0
         
-        candidates.append({
-            'pts': quad_pts,
-            'center': (cx, cy),
-            'w': w, 'h': h,
-            'area': area,
-            'score': score
-        })
+        for q_pts in quad_list:
+            candidates.append({
+                'pts': q_pts,
+                'center': (cx, cy),
+                'w': w, 'h': h,
+                'area': area,
+                'score': base_score
+            })
         
     candidates.sort(key=lambda x: x['score'], reverse=True)
-    distinct = []
+    
+    # 동일 위치의 사진 후보들을 그룹핑하여 가장 테두리가 완벽한 후보 선택
+    clusters = []
     for cand in candidates:
         cx1, cy1 = cand['center']
-        is_overlap = False
-        for kept in distinct:
-            dist = np.hypot(cx1 - kept['center'][0], cy1 - kept['center'][1])
-            if dist < min(cand['w'], kept['w']) * 0.65:
-                is_overlap = True
+        placed = False
+        for cluster in clusters:
+            cx2, cy2 = cluster[0]['center']
+            dist = np.hypot(cx1 - cx2, cy1 - cy2)
+            if dist < min(cand['w'], cluster[0]['w']) * 0.65:
+                if len(cluster) < 4:
+                    cluster.append(cand)
+                placed = True
                 break
-        if not is_overlap:
-            distinct.append(cand)
+        if not placed:
+            clusters.append([cand])
             
-    distinct.sort(key=lambda x: (x['center'][1] // 200, x['center'][0]))
+    # 좌상단부터 순서대로 클러스터 정렬
+    clusters.sort(key=lambda cl: (cl[0]['center'][1] // 200, cl[0]['center'][0]))
     
     target_w, target_h = 350, 450
     dst = np.array([[0, 0], [target_w-1, 0], [target_w-1, target_h-1], [0, target_h-1]], dtype="float32")
     
     verified_photos = []
-    for p in distinct:
-        ordered_pts = robust_order_points(p['pts'])
-        M = cv2.getPerspectiveTransform(ordered_pts, dst)
-        warped = cv2.warpPerspective(image, M, (target_w, target_h), flags=cv2.INTER_CUBIC)
-        refined = refine_and_deskew(warped, target_w, target_h)
+    for cl in clusters:
+        best_photo = None
+        best_q_score = -1e9
         
-        if is_actual_portrait_photo(refined):
-            verified_photos.append(refined)
+        for p in cl:
+            ordered_pts = robust_order_points(p['pts'])
+            M = cv2.getPerspectiveTransform(ordered_pts, dst)
+            warped = cv2.warpPerspective(image, M, (target_w, target_h), flags=cv2.INTER_CUBIC)
+            refined = refine_and_deskew(warped, target_w, target_h)
+            
+            if is_actual_portrait_photo(refined):
+                q_score = score_photo_quality(refined)
+                if q_score > best_q_score:
+                    best_q_score = q_score
+                    best_photo = refined
+                    
+        if best_photo is not None:
+            verified_photos.append(best_photo)
             
     return verified_photos
 
@@ -293,7 +558,7 @@ if st.button("사진 제출 및 자동 스캔 완료", type="primary"):
     elif not uploaded_file:
         st.warning("⚠️ 증명사진 파일을 업로드해주세요!")
     else:
-        with st.spinner("사진을 분석하고 정밀 스캔 중입니다..."):
+        with st.spinner("사진을 분석하고 모서리 4점을 정밀 보정 중입니다..."):
             try:
                 file_bytes = np.frombuffer(uploaded_file.read(), np.uint8)
                 image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
