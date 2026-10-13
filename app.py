@@ -55,7 +55,7 @@ with col2:
 uploaded_file = st.file_uploader("증명사진 파일 업로드 (스마트폰 촬영 또는 파일 선택)", type=['jpg', 'jpeg', 'png', 'JPG', 'JPEG', 'PNG'])
 
 def robust_order_points(pts):
-    """4개의 꼭짓점을 시계 방향(좌상, 우상, 우하, 좌하)으로 정렬"""
+    """카메라 촬영 기준에 맞추어 4개 꼭짓점을 [좌상, 우상, 우하, 좌하]로 정확히 매핑"""
     pts = np.array(pts, dtype="float32").reshape(4, 2)
     x_sorted = pts[np.argsort(pts[:, 0]), :]
     left_most = x_sorted[:2, :]
@@ -67,17 +67,10 @@ def robust_order_points(pts):
     right_most = right_most[np.argsort(right_most[:, 1]), :]
     tr, br = right_most
 
-    ordered = np.array([tl, tr, br, bl], dtype="float32")
-    
-    w = (np.linalg.norm(ordered[0] - ordered[1]) + np.linalg.norm(ordered[3] - ordered[2])) / 2.0
-    h = (np.linalg.norm(ordered[1] - ordered[2]) + np.linalg.norm(ordered[0] - ordered[3])) / 2.0
-    if w > h:
-        ordered = np.roll(ordered, -1, axis=0)
-        
-    return ordered
+    return np.array([tl, tr, br, bl], dtype="float32")
 
 def get_true_quad(contour):
-    """인화지의 실제 4개 꼭짓점 정밀 검출"""
+    """인화지의 실제 4개 모서리 꼭짓점 검출"""
     hull = cv2.convexHull(contour)
     peri = cv2.arcLength(hull, True)
     for eps in [0.03, 0.04, 0.02, 0.05, 0.015]:
@@ -87,34 +80,8 @@ def get_true_quad(contour):
     rect = cv2.minAreaRect(hull)
     return cv2.boxPoints(rect).astype("float32")
 
-def correct_orientation(img):
-    """얼굴(피부)과 상단 배경, 옷의 위치를 분석하여 항상 머리가 위로 가도록 자동 회전"""
-    best_rot = img
-    max_score = -1e9
-    for k in [0, 1, 2, 3]:
-        rot = np.rot90(img, k)
-        rh, rw = rot.shape[:2]
-        hsv = cv2.cvtColor(rot, cv2.COLOR_BGR2HSV)
-        
-        # 상단 얼굴 영역 피부톤
-        face_roi = hsv[int(rh * 0.20):int(rh * 0.65), int(rw * 0.20):int(rw * 0.80)]
-        lower_skin = np.array([0, 25, 50], dtype=np.uint8)
-        upper_skin = np.array([25, 190, 255], dtype=np.uint8)
-        skin_mask = cv2.inRange(face_roi, lower_skin, upper_skin)
-        skin_ratio = (skin_mask > 0).mean()
-        
-        top_val = cv2.cvtColor(rot[:int(rh * 0.15), :], cv2.COLOR_BGR2GRAY).mean()
-        body_val = cv2.cvtColor(rot[int(rh * 0.70):, :], cv2.COLOR_BGR2GRAY).mean()
-        
-        score = skin_ratio * 120.0 + (top_val - body_val) * 0.4
-        if score > max_score:
-            max_score = score
-            best_rot = rot
-    return best_rot
-
 def refine_and_deskew(warped, target_w=350, target_h=450):
-    """결과물을 재점검하고 미세 기울기와 각도를 2차 정밀 보정"""
-    warped = correct_orientation(warped)
+    """미세한 기울기(각도 오차)만 수평 0도로 정밀 보정 (상하반전 금지)"""
     if warped.shape[0] != target_h or warped.shape[1] != target_w:
         warped = cv2.resize(warped, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
         
@@ -129,43 +96,37 @@ def refine_and_deskew(warped, target_w=350, target_h=450):
             if len(line_arr) >= 4:
                 x1, y1, x2, y2 = line_arr[:4]
                 deg = np.degrees(np.arctan2(y2 - y1, x2 - x1))
-                if abs(deg) < 15:
+                if abs(deg) < 12:
                     angles.append(deg)
-                elif abs(deg - 180) < 15:
+                elif abs(deg - 180) < 12:
                     angles.append(deg - 180)
-                elif abs(deg + 180) < 15:
+                elif abs(deg + 180) < 12:
                     angles.append(deg + 180)
-                elif abs(abs(deg) - 90) < 15:
+                elif abs(abs(deg) - 90) < 12:
                     angles.append(deg - 90 if deg > 0 else deg + 90)
                 
+    # 5도 이내의 미세 회전 오차만 정밀 평행 보정
     if len(angles) >= 2:
         tilt = float(np.median(angles))
-        if 0.25 <= abs(tilt) < 10.0:
+        if 0.25 <= abs(tilt) < 5.0:
             rot_M = cv2.getRotationMatrix2D((target_w / 2.0, target_h / 2.0), tilt, 1.0)
             warped = cv2.warpAffine(warped, rot_M, (target_w, target_h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
             
-    corners = [
-        warped[0:10, 0:10],
-        warped[0:10, target_w-10:target_w],
-        warped[target_h-10:target_h, 0:10],
-        warped[target_h-10:target_h, target_w-10:target_w]
-    ]
-    corner_means = [c.mean() for c in corners]
-    trim = 5 if min(corner_means) < 110 else 2
-    
+    # 외곽 바닥면 잔상 정리 (2px 안전 마진)
+    trim = 2
     final = warped[trim:target_h-trim, trim:target_w-trim]
     return cv2.resize(final, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
 
 def is_actual_portrait_photo(cropped_img):
-    """엄격한 증명사진 최종 자가 검증 (피부톤 + 이목구비 + 전체명암)"""
+    """엄격한 증명사진 최종 자가 검증 (피부톤 + 이목구비 + 명암)"""
     h, w = cropped_img.shape[:2]
     hsv = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2GRAY)
     
-    # [차단 1] 시커먼 암전 이미지, 빛 번짐 단색 이미지 배제
+    # [차단 1] 시커먼 암전 이미지, 극단적 단색 배제
     overall_mean = gray.mean()
     overall_std = gray.std()
-    if overall_mean < 65 or overall_mean > 240 or overall_std < 25:
+    if overall_mean < 65 or overall_mean > 240 or overall_std < 22:
         return False
         
     # [차단 2] 중심부 사람 피부톤 검증
@@ -178,19 +139,14 @@ def is_actual_portrait_photo(cropped_img):
     mask2 = cv2.inRange(roi_hsv, lower_skin2, upper_skin2)
     skin_mask = cv2.bitwise_or(mask1, mask2)
     skin_ratio = np.sum(skin_mask > 0) / (roi_hsv.shape[0] * roi_hsv.shape[1])
-    if skin_ratio < 0.10:
+    if skin_ratio < 0.08:
         return False
         
     # [차단 3] 눈·코·입 등 이목구비 윤곽선 검증 (평평한 나무책상/플라스틱 배제)
     gray_roi = gray[int(h * 0.15):int(h * 0.75), int(w * 0.20):int(w * 0.80)]
     edges = cv2.Canny(gray_roi, 50, 150)
     edge_count = (edges > 0).sum()
-    if edge_count < 120:
-        return False
-        
-    # [차단 4] 상단 모서리 배경 밝기 (증명사진 상단 배경 최소 밝기 확인)
-    top_corners = np.concatenate([gray[:20, :30].flatten(), gray[:20, -30:].flatten()])
-    if top_corners.mean() < 80:
+    if edge_count < 100:
         return False
         
     return True
@@ -213,7 +169,7 @@ def extract_all_photos(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     
-    # 형광등 빛 반사(글레어)에 구애받지 않는 다중 채널 윤곽선 추출
+    # 조명/그림자에 구애받지 않는 다중 채널 윤곽선 추출
     _, thresh_bright = cv2.threshold(blur, 130, 255, cv2.THRESH_BINARY)
     _, thresh_otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     thresh_adapt = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 7)
@@ -277,6 +233,7 @@ def extract_all_photos(image):
         if not is_overlap:
             distinct.append(cand)
             
+    # 좌상단부터 순서대로 정렬
     distinct.sort(key=lambda x: (x['center'][1] // 200, x['center'][0]))
     
     target_w, target_h = 350, 450
@@ -289,11 +246,11 @@ def extract_all_photos(image):
         warped = cv2.warpPerspective(image, M, (target_w, target_h), flags=cv2.INTER_CUBIC)
         refined = refine_and_deskew(warped, target_w, target_h)
         
-        # [핵심] 철저한 최종 검증을 통과한 진짜 증명사진만 담음!
+        # [철저한 검증] 증명사진으로 완벽히 판정된 사진만 최종 통과
         if is_actual_portrait_photo(refined):
             verified_photos.append(refined)
             
-    # [핵심] 검증에 통과한 사진이 없으면 절대로 찌꺼기를 내보내지 않고 빈 리스트 반환!
+    # 통과한 사진이 없으면 절대로 잔상/잡동사니를 내보내지 않고 빈 리스트 반환
     return verified_photos
 
 def upload_via_gas(file_bytes, file_name, gas_url):
@@ -328,7 +285,7 @@ if st.button("사진 제출 및 자동 스캔 완료", type="primary"):
                 
                 # [게이트키퍼] 진짜 증명사진 판정이 안 나면 절대 드라이브 전송하지 않고 에러 출력!
                 if not processed_photos:
-                    st.error("🚨 **사진 속에서 규격에 맞는 증명사진을 찾을 수 없습니다!**\n\n- 형광등 빛 반사가 없는 곳에서 증명사진이 잘 보이도록 조금 더 가까이 촬영해 주세요.\n- 증명사진이 바르게 놓여 있는지 확인 후 다시 업로드해 주세요.")
+                    st.error("🚨 **사진 속에서 규격에 맞는 증명사진을 감지하지 못했습니다!**\n\n- 빛 반사가 심하거나 증명사진이 너무 작게 찍혔습니다.\n- 사진이 잘 보이도록 조금 더 가까이 촬영한 후 다시 업로드해 주세요.")
                 else:
                     uploaded_names = []
                     for idx, photo in enumerate(processed_photos):
