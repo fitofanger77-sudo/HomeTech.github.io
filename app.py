@@ -11,7 +11,7 @@ st.set_page_config(page_title="증명사진 수집 시스템", page_icon="📸")
 
 # 세션 상태 초기화
 if "photo_groups" not in st.session_state:
-    st.session_state["photo_groups"] = None  # 감지된 사진별 [스캔본 4종 리스트]
+    st.session_state["photo_groups"] = None  # 감지된 사진별 [스캔본 3종 리스트]
 if "selected_photo_idx" not in st.session_state:
     st.session_state["selected_photo_idx"] = 0
 if "selected_style_idx" not in st.session_state:
@@ -92,7 +92,7 @@ is_direct_digital_mode = ("디지털 증명사진 원본" in upload_mode)
 if is_direct_digital_mode:
     st.caption("💡 사진관에서 받은 이미지 파일이나 이미 여백 없이 잘라진 증명사진 파일을 선택해 주세요.")
 else:
-    st.caption("💡 종이 증명사진을 책상 위에 놓고 찍은 사진 파일을 올려주세요. (스마트폰에서는 아래 파일 선택 버튼을 누르면 기본 카메라로 바로 촬영할 수도 있습니다.)")
+    st.caption("💡 종이 증명사진을 책상 위에 놓고 찍은 사진 파일을 올려주세요. (스마트폰에서는 파일 선택 버튼을 누르면 기본 카메라로 바로 촬영할 수도 있습니다.)")
 
 uploaded_file = st.file_uploader(
     "증명사진 파일 선택 (JPG, PNG)",
@@ -174,7 +174,7 @@ def enhance_studio_lighting(img):
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
     
-    # CLAHE로 국소 명암 대비 개선 및 자연스러운 밝기 상승
+    # CLAHE로 자연스러운 명암비 개선 및 밝기 상승
     clahe = cv2.createCLAHE(clipLimit=1.6, tileGridSize=(8, 8))
     l_enhanced = clahe.apply(l_ch)
     l_blended = cv2.addWeighted(l_enhanced, 0.65, l_ch, 0.35, 6)
@@ -182,7 +182,6 @@ def enhance_studio_lighting(img):
     merged = cv2.merge((l_blended, a_ch, b_ch))
     bright_img = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
     
-    # 미세 샤프닝으로 얼굴 선명도 개선
     gaussian = cv2.GaussianBlur(bright_img, (0, 0), 1.2)
     sharpened = cv2.addWeighted(bright_img, 1.25, gaussian, -0.25, 0)
     return sharpened
@@ -201,9 +200,9 @@ def get_skin_mask(hsv_img):
 def is_valid_portrait_candidate(cropped_img):
     """
     [인물 사진 판별기]
-    - 자물쇠, 플라스틱 거치대, 빈 책상 바닥은 완벽 탈락
-    - 코/입만 확대된 얼굴 클로즈업 오류 완벽 탈락
-    - 정통 증명사진 및 폴라로이드 인물 사진은 모두 정상 통과 (다중 사진 선택 지원)
+    - 자물쇠, 플라스틱 거치대, 빈 책상 바닥 탈락
+    - 코/입만 확대된 얼굴 클로즈업 오류 탈락
+    - 정통 증명사진 및 폴라로이드 인물 사진 정상 통과
     """
     h, w = cropped_img.shape[:2]
     gray = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2GRAY).astype("float32")
@@ -221,16 +220,15 @@ def is_valid_portrait_candidate(cropped_img):
     center_skin_ratio = float((center_skin > 0).mean())
     overall_skin_ratio = float((skin_mask > 0).mean())
     
-    # 사물(자물쇠 3%, 플라스틱 1%)은 7% 미만이므로 탈락, 코/입 클로즈업(70% 초과)도 탈락!
     if center_skin_ratio < 0.07 or center_skin_ratio > 0.66 or overall_skin_ratio > 0.50:
         return False
         
-    # 3. 사진 최상단 끝 테두리 피부 침범 검사 (코/입/이마만 확대되어 살색이 사진 천장에 닿은 경우 탈락)
+    # 3. 사진 최상단 끝 테두리 피부 침범 검사 (얼굴 클로즈업 탈락)
     top_edge_skin = float((skin_mask[0:int(h * 0.08), :] > 0).mean())
     if top_edge_skin > 0.18:
         return False
         
-    # 4. 중심부 이목구비 윤곽선(Edge) 밀도 검사 (평평한 나무 책상 배제)
+    # 4. 중심부 이목구비 윤곽선 밀도 검사
     gray_roi = cv2.cvtColor(cropped_img[int(h * 0.15):int(h * 0.78), int(w * 0.18):int(w * 0.82)], cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray_roi, 45, 140)
     if (edges > 0).sum() < 95:
@@ -249,114 +247,80 @@ def score_rect_cleanliness(img):
     tl_s = hsv[6:42, 6:42, 1]
     tr_s = hsv[6:42, w-42:w-6, 1]
     
-    # 좌우 모서리 대칭성 (한쪽에만 책상/그림자가 낀 사다리꼴 감점)
     lr_diff = abs(float(tl_g.mean()) - float(tr_g.mean())) + abs(float(tl_s.mean()) - float(tr_s.mean()))
     min_bright = min(float(tl_g.mean()), float(tr_g.mean()))
     max_std = max(float(tl_g.std()), float(tr_g.std()))
     
     return min_bright - lr_diff * 1.6 - max_std * 1.2
 
-def build_4_scan_styles_for_cluster(image, cluster_items):
+def build_3_scan_styles_for_cluster(image, cluster_items):
     """
-    하나의 감지된 사진 클러스터에 대해 학생이 직접 비교·선택할 수 있도록
-    4가지 서로 다른 형태의 스캔본을 생성하여 반환
+    감지된 인물 사진에 대해 안정적이고 명확한 3가지 스캔본 생성
+    (직각보정 왜곡 로직 제거)
     """
     target_w, target_h = 350, 450
     dst = np.array([[0, 0], [target_w-1, 0], [target_w-1, target_h-1], [0, target_h-1]], dtype="float32")
     
     max_area = max(x['area'] for x in cluster_items)
-    # 너무 작은 내부 조각(코/입 등)은 제외하되, 인화지 외곽(100%)과 내부 사진 프레임(55% 이상)은 모두 수집
-    valid_items = [x for x in cluster_items if x['area'] >= max_area * 0.55]
+    valid_items = [x for x in cluster_items if x['area'] >= max_area * 0.60]
     
-    poly_candidates = []
-    rect_candidates = []
-    restored_candidates = []
-    
-    for item in valid_items[:6]:
+    all_candidates = []
+    for item in valid_items[:5]:
         hull = item['cnt']
         peri = cv2.arcLength(hull, True)
         
-        # A) 최소외접사각형(minAreaRect) 기반 직교 스캔
+        # 1. 외곽 사각형 기반 스캔
         rect = cv2.minAreaRect(hull)
         r_pts = robust_order_points(cv2.boxPoints(rect).astype("float32"))
         M_r = cv2.getPerspectiveTransform(r_pts, dst)
         w_r = gentle_deskew(cv2.warpPerspective(image, M_r, (target_w, target_h), flags=cv2.INTER_CUBIC), target_w, target_h, trim_px=3)
         if is_valid_portrait_candidate(w_r):
-            rect_candidates.append((score_rect_cleanliness(w_r), w_r))
+            all_candidates.append((score_rect_cleanliness(w_r), w_r))
             
-        # B) 다각형 4점(approxPolyDP) 및 3점 대칭 직각 복원 스캔
-        for eps in [0.02, 0.025, 0.03, 0.04]:
+        # 2. 다각형 4점 기반 스캔
+        for eps in [0.02, 0.025, 0.03]:
             approx = cv2.approxPolyDP(hull, eps * peri, True)
             if len(approx) == 4 and cv2.isContourConvex(approx):
                 ordered = robust_order_points(approx.reshape(4, 2).astype("float32"))
                 M_p = cv2.getPerspectiveTransform(ordered, dst)
                 w_p = gentle_deskew(cv2.warpPerspective(image, M_p, (target_w, target_h), flags=cv2.INTER_CUBIC), target_w, target_h, trim_px=3)
                 if is_valid_portrait_candidate(w_p):
-                    poly_candidates.append((score_rect_cleanliness(w_p), w_p))
-                    
-                # 빛 반사나 그림자로 1개 모서리가 튄 경우 반대쪽 3개 모서리로 직각 복원
-                orig_a = cv2.contourArea(ordered)
-                for k in range(4):
-                    opp = (k + 2) % 4
-                    fixed = ordered.copy()
-                    fixed[k] = ordered[(k - 1) % 4] + ordered[(k + 1) % 4] - ordered[opp]
-                    if cv2.isContourConvex(fixed):
-                        fa = cv2.contourArea(fixed)
-                        if orig_a * 0.70 <= fa <= orig_a * 1.05:
-                            f_ord = robust_order_points(fixed)
-                            M_f = cv2.getPerspectiveTransform(f_ord, dst)
-                            w_f = gentle_deskew(cv2.warpPerspective(image, M_f, (target_w, target_h), flags=cv2.INTER_CUBIC), target_w, target_h, trim_px=3)
-                            if is_valid_portrait_candidate(w_f):
-                                restored_candidates.append((score_rect_cleanliness(w_f), w_f))
+                    all_candidates.append((score_rect_cleanliness(w_p), w_p))
                 break
                 
-    all_valid = poly_candidates + restored_candidates + rect_candidates
-    if not all_valid:
+    if not all_candidates:
         return None
         
-    all_valid.sort(key=lambda x: x[0], reverse=True)
-    best_overall = all_valid[0][1]
+    all_candidates.sort(key=lambda x: x[0], reverse=True)
+    best_standard = all_candidates[0][1]
     
-    # 스타일 1: 가장 깔끔하게 평가된 표준 스캔본
-    style_1 = best_overall
+    # 타입 A: 표준 자동 스캔 (기본)
+    style_a = best_standard
     
-    # 스타일 2: 다른 기하학 방식(직각 복원본 vs 다각형 원본 vs 외접사각형) 중 차선책 스캔본 제공
-    style_2 = None
-    for _, cand_img in all_valid[1:]:
-        diff = np.mean(np.abs(cand_img.astype("float32") - style_1.astype("float32")))
-        if diff > 4.5:  # 스타일 1과 시각적 차이가 있는 다른 각도/테두리 스캔본 선택
-            style_2 = cand_img
-            break
-    if style_2 is None:
-        # 차이가 거의 없다면 상하좌우 3% 안쪽 크롭본으로 대체
-        tx, ty = int(target_w * 0.03), int(target_h * 0.03)
-        style_2 = cv2.resize(style_1[ty:target_h-ty, tx:target_w-tx], (target_w, target_h), interpolation=cv2.INTER_CUBIC)
-        
-    # 스타일 3: 테두리 여백 완전 제거 (가장자리 흰 테두리나 미세 잔상을 6% 안쪽으로 깔끔하게 잘라낸 밀착 스캔본)
-    tx_tight, ty_tight = int(target_w * 0.06), int(target_h * 0.055)
-    tight_crop = style_1[ty_tight:target_h-ty_tight, tx_tight:target_w-tx_tight]
-    style_3 = cv2.resize(tight_crop, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
+    # 타입 B: 테두리 밀착 스캔 (테두리 여백/바닥 잔상을 5% 안쪽으로 깔끔하게 정리)
+    tx_tight, ty_tight = int(target_w * 0.05), int(target_h * 0.05)
+    tight_crop = style_a[ty_tight:target_h-ty_tight, tx_tight:target_w-tx_tight]
+    style_b = cv2.resize(tight_crop, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
     
-    # 스타일 4: 화사한 스튜디오 조명·선명도 보정본
-    style_4 = enhance_studio_lighting(style_1)
+    # 타입 C: 화사한 조명·선명도 보정본
+    style_c = enhance_studio_lighting(style_a)
     
     return [
-        ("타입 A: 표준 자동 스캔 (추천)", style_1),
-        ("타입 B: 모서리 직각 보정 스캔", style_2),
-        ("타입 C: 테두리 여백 제거(밀착) 스캔", style_3),
-        ("타입 D: 화사한 조명·선명도 보정본", style_4)
+        ("타입 A: 표준 자동 스캔 (추천)", style_a),
+        ("타입 B: 테두리 밀착 스캔 (여백 제거)", style_b),
+        ("타입 C: 화사한 조명·선명도 보정본", style_c)
     ]
 
 def extract_photo_groups(image, is_digital_mode=False):
     """
-    업로드된 이미지에서 모든 인물 사진을 찾고,
-    각 사진마다 4가지 형태의 스캔본 리스트를 묶어서 반환
+    업로드된 이미지에서 인물 사진들을 찾고,
+    각 사진마다 3가지 스캔본(표준, 밀착, 조명보정)을 리스트로 반환
     """
     target_w, target_h = 350, 450
     img_h, img_w = image.shape[:2]
     img_area = img_h * img_w
     
-    # 1. 디지털 원본 파일 모드이거나 이미 여백 없이 꽉 찬 디지털 파일인 경우
+    # 1. 디지털 원본 파일 모드이거나 이미 여백 없는 디지털 사진인 경우
     top_b = image[0:5, :, :]
     bottom_b = image[img_h-5:img_h, :, :]
     left_b = image[:, 0:5, :]
@@ -364,8 +328,6 @@ def extract_photo_groups(image, is_digital_mode=False):
     border_concat = np.concatenate([top_b.flatten(), bottom_b.flatten(), left_b.flatten(), right_b.flatten()])
     
     if is_digital_mode or np.mean(border_concat) > 155:
-        base_resized = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
-        # 비율 유지 중앙 크롭 버전
         target_ratio = target_w / float(target_h)
         cur_ratio = img_w / float(img_h)
         if cur_ratio > target_ratio:
@@ -377,6 +339,7 @@ def extract_photo_groups(image, is_digital_mode=False):
             y0 = (img_h - new_h) // 2
             center_cropped = cv2.resize(image[y0:y0+new_h, :], (target_w, target_h), interpolation=cv2.INTER_CUBIC)
             
+        base_resized = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
         tx, ty = int(target_w * 0.04), int(target_h * 0.04)
         margin_trimmed = cv2.resize(center_cropped[ty:target_h-ty, tx:target_w-tx], (target_w, target_h), interpolation=cv2.INTER_CUBIC)
         studio_bright = enhance_studio_lighting(center_cropped)
@@ -384,9 +347,8 @@ def extract_photo_groups(image, is_digital_mode=False):
         if is_digital_mode or is_valid_portrait_candidate(base_resized):
             return [[
                 ("타입 A: 원본 비율 유지 스캔 (추천)", center_cropped),
-                ("타입 B: 전체 꽉 채움 리사이즈", base_resized),
-                ("타입 C: 테두리 미세 여백 제거본", margin_trimmed),
-                ("타입 D: 화사한 조명·선명도 보정본", studio_bright)
+                ("타입 B: 테두리 밀착 스캔 (여백 제거)", margin_trimmed),
+                ("타입 C: 화사한 조명·선명도 보정본", studio_bright)
             ]]
             
     # 2. 실물 촬영본 다중 탐색
@@ -394,7 +356,6 @@ def extract_photo_groups(image, is_digital_mode=False):
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     hsv_full = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     
-    # 다중 채널 마스크로 빛 반사 환경과 서랍 속 다중 사진을 모두 포착
     thresh_adapt = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 5)
     edged = cv2.Canny(blur, 30, 140)
     combined_edge = cv2.bitwise_or(thresh_adapt, edged)
@@ -444,7 +405,7 @@ def extract_photo_groups(image, is_digital_mode=False):
         
     raw_items.sort(key=lambda x: x['area'], reverse=True)
     
-    # 사진 위치별 클러스터링 (서랍 속 폴라로이드와 증명사진처럼 떨어진 사진들을 독립 그룹으로 분리)
+    # 위치별 클러스터링 (독립된 사진들 분리)
     clusters = []
     for item in raw_items:
         cx1, cy1 = item['center']
@@ -459,12 +420,11 @@ def extract_photo_groups(image, is_digital_mode=False):
         if not placed:
             clusters.append([item])
             
-    # 좌상단부터 우하단 순으로 정렬
     clusters.sort(key=lambda cl: (cl[0]['center'][1] // 200, cl[0]['center'][0]))
     
     photo_groups = []
     for cl in clusters:
-        styles = build_4_scan_styles_for_cluster(image, cl)
+        styles = build_3_scan_styles_for_cluster(image, cl)
         if styles is not None:
             photo_groups.append(styles)
             
@@ -484,7 +444,7 @@ def upload_via_gas(file_bytes, file_name, gas_url):
         raise Exception(result.get("message", "알 수 없는 전송 오류"))
 
 # --- 1차 스캔 실행 버튼 ---
-if st.button("🔍 사진 스캔 및 여러 스캔본 보기", type="primary", use_container_width=True):
+if st.button("🔍 사진 스캔 및 스캔본 확인하기", type="primary", use_container_width=True):
     st.session_state["photo_groups"] = None
     st.session_state["selected_photo_idx"] = 0
     st.session_state["selected_style_idx"] = 0
@@ -498,7 +458,7 @@ if st.button("🔍 사진 스캔 및 여러 스캔본 보기", type="primary", u
     elif uploaded_file is None:
         st.warning("⚠️ 먼저 증명사진 파일을 업로드해주세요!")
     else:
-        with st.spinner("사진을 정밀 분석하여 맞춤형 스캔본들을 생성하고 있습니다..."):
+        with st.spinner("사진을 분석하여 깔끔한 스캔본들을 생성하고 있습니다..."):
             try:
                 file_bytes = np.frombuffer(uploaded_file.getvalue(), np.uint8)
                 image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
@@ -507,10 +467,10 @@ if st.button("🔍 사진 스캔 및 여러 스캔본 보기", type="primary", u
                 
                 if not groups:
                     st.error(
-                        "🚨 **사진 속에서 증명사진을 찾지 못했습니다! 다시 촬영해 주세요.**\n\n"
+                        "🚨 **사진 속에서 증명사진을 감지하지 못했습니다! 다시 촬영해 주세요.**\n\n"
                         "**[재촬영 안내]**\n"
                         "1. 증명사진이 너무 멀리 찍혔거나 형광등 빛 반사가 심할 수 있습니다.\n"
-                        "2. 어두운 책상이나 바닥 위에 사진을 놓고 **네 모서리가 모두 보이도록** 다시 촬영해 주세요.\n"
+                        "2. 어두운 책상이나 마우스패드 위에 사진을 놓고 **네 모서리가 모두 보이도록** 다시 촬영해 주세요.\n"
                         "3. 만약 사진관에서 받은 원본 파일이라면 위에서 **'🖼️ 디지털 증명사진 원본 파일 올리기'**를 선택해 주세요."
                     )
                 else:
@@ -519,7 +479,7 @@ if st.button("🔍 사진 스캔 및 여러 스캔본 보기", type="primary", u
             except Exception as e:
                 st.error(f"이미지 분석 중 오류가 발생했습니다: {e}")
 
-# --- 2단계: 다중 사진 선택 & 4가지 스캔 형태 선택 UI ---
+# --- 2단계: 다중 사진 선택 & 3가지 스캔 형태 선택 UI ---
 if st.session_state["photo_groups"] is not None:
     groups = st.session_state["photo_groups"]
     s_id, s_name = st.session_state["student_meta"]
@@ -543,11 +503,11 @@ if st.session_state["photo_groups"] is not None:
                     st.session_state["rotation_deg"] = 0
                     st.rerun()
 
-    # [B] 선택된 사진에 대한 4가지 스캔본 제시 및 선택
+    # [B] 선택된 사진에 대한 3가지 스캔본 제시 및 선택
     st.markdown("---")
     step_num = "3️⃣" if len(groups) > 1 else "2️⃣"
     st.subheader(f"{step_num} 가장 마음에 드는 스캔 형태를 골라주세요")
-    st.write("같은 사진이라도 테두리 여백과 보정 방식에 따라 4가지 버전으로 스캔되었습니다. **가장 반듯하고 깔끔한 버전을 선택**해 주세요.")
+    st.write("테두리 여백과 보정 방식에 따라 3가지 버전으로 스캔되었습니다. **가장 반듯하고 깔끔한 버전을 선택**해 주세요.")
     
     current_styles = groups[st.session_state["selected_photo_idx"]]
     s_cols = st.columns(len(current_styles))
@@ -585,8 +545,8 @@ if st.session_state["photo_groups"] is not None:
             f"**📌 선택된 제출 정보**\n"
             f"- **저장될 파일명:** `{s_id}_{s_name}.jpg`\n"
             f"- **선택한 스캔 형태:** {chosen_title}\n\n"
-            f"왼쪽 미리보기 사진이 본인의 증명사진이 맞고 깔끔하게 스캔되었다면 아래 **최종 제출** 버튼을 눌러주세요.\n"
-            f"만약 4가지 스캔본 모두 마음에 들지 않는다면 **다시 촬영 / 재업로드** 버튼을 눌러 새 사진을 올릴 수 있습니다."
+            f"미리보기 사진이 본인의 증명사진이 맞고 깔끔하게 스캔되었다면 아래 **최종 제출** 버튼을 눌러주세요.\n"
+            f"마음에 들지 않으면 **다시 촬영 / 재업로드** 버튼을 눌러 새로 등록할 수 있습니다."
         )
         st.write("")
         if st.button("✅ 네, 지금 선택한 스캔본으로 최종 제출합니다!", type="primary", use_container_width=True):
