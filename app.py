@@ -28,8 +28,8 @@ if "uploader_key" not in st.session_state:
     st.session_state["uploader_key"] = 0
 
 # 선생님 링크 및 QR 정보 세션 저장
-if "short_url" not in st.session_state:
-    st.session_state["short_url"] = ""
+if "share_url" not in st.session_state:
+    st.session_state["share_url"] = ""
 if "qr_api_url" not in st.session_state:
     st.session_state["qr_api_url"] = ""
 if "qr_bytes" not in st.session_state:
@@ -57,26 +57,6 @@ def get_current_base_url():
         pass
     return ""
 
-def make_short_url(long_url):
-    """긴 웹 주소를 간결한 단축 URL(TinyURL / is.gd)로 변환"""
-    try:
-        api_url = f"https://tinyurl.com/api-create.php?url={urllib.parse.quote(long_url)}"
-        resp = requests.get(api_url, timeout=4)
-        if resp.status_code == 200 and resp.text.startswith("http"):
-            return resp.text.strip()
-    except Exception:
-        pass
-        
-    try:
-        api_url = f"https://is.gd/create.php?format=simple&url={urllib.parse.quote(long_url)}"
-        resp = requests.get(api_url, timeout=4)
-        if resp.status_code == 200 and resp.text.startswith("http"):
-            return resp.text.strip()
-    except Exception:
-        pass
-        
-    return long_url
-
 # 1. URL 주소에서 선생님 고유 코드(?t=...) 자동 인식 (Secrets 백업 호환)
 current_code = st.query_params.get("t", "")
 target_gas_url = ""
@@ -92,25 +72,25 @@ elif "gas_url" in st.secrets:
 st.title("📸 증명사진 수집 및 자동 스캔")
 st.write("학번과 이름을 입력하고 증명사진을 올리면, 여러 형태의 스캔본 중 가장 마음에 드는 사진을 직접 골라 선생님께 제출할 수 있습니다.")
 
-# --- ⚙️ [선생님 전용 영역] 단축 URL & QR 코드 배포 센터 ---
+# --- ⚙️ [선생님 전용 영역] 다이렉트 URL & QR 코드 배포 센터 ---
 if st.session_state.get("is_teacher_creator", False) and current_code:
     with st.container():
-        st.success("🎉 **우리 반 전용 단축 링크와 QR 코드가 생성되었습니다!**")
+        st.success("🎉 **우리 반 전용 접속 링크와 QR 코드가 생성되었습니다!**")
         
-        # 단축 URL 및 QR 이미지가 세션에 없으면 생성
-        if not st.session_state["short_url"] or not st.session_state["qr_api_url"]:
+        # 다이렉트 URL 및 QR 이미지가 세션에 없으면 생성 (단축 URL 제거)
+        if not st.session_state["share_url"] or not st.session_state["qr_api_url"]:
             detected_base = get_current_base_url() or "https://share.streamlit.io"
-            long_url = f"{detected_base}/?t={current_code}"
-            s_url = make_short_url(long_url)
-            qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&margin=10&data={urllib.parse.quote(s_url)}"
-            st.session_state["short_url"] = s_url
+            direct_url = f"{detected_base}/?t={current_code}"
+            qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&margin=10&data={urllib.parse.quote(direct_url)}"
+            
+            st.session_state["share_url"] = direct_url
             st.session_state["qr_api_url"] = qr_url
             try:
                 st.session_state["qr_bytes"] = requests.get(qr_url, timeout=5).content
             except Exception:
                 st.session_state["qr_bytes"] = None
 
-        s_url = st.session_state["short_url"]
+        s_url = st.session_state["share_url"]
         qr_url = st.session_state["qr_api_url"]
         qr_bytes = st.session_state["qr_bytes"]
 
@@ -118,7 +98,6 @@ if st.session_state.get("is_teacher_creator", False) and current_code:
         with qr_col:
             st.image(qr_url, width=220, caption="교실 TV / 가정통신문용 QR 코드")
             
-            # HTML5 Clipboard API를 활용한 원클릭 QR 이미지 복사 컴포넌트
             copy_qr_html = f"""
             <div style="margin-top: 5px; margin-bottom: 8px;">
                 <button id="copyQrBtn" onclick="copyQrImage()" style="
@@ -165,10 +144,9 @@ if st.session_state.get("is_teacher_creator", False) and current_code:
                 )
 
         with link_col:
-            st.markdown("### 🔗 학생 배포용 단축 URL")
+            st.markdown("### 🔗 학생 배포용 접속 링크")
             st.code(s_url, language=None)
             
-            # 단축 URL 복사 버튼 컴포넌트
             copy_url_html = f"""
             <div style="margin-bottom: 12px;">
                 <button id="copyUrlBtn" onclick="copyTextUrl()" style="
@@ -180,14 +158,14 @@ if st.session_state.get("is_teacher_creator", False) and current_code:
                     font-size: 13px;
                     font-weight: bold;
                     cursor: pointer;
-                ">📋 단축 링크 복사하기</button>
+                ">📋 접속 링크 복사하기</button>
             </div>
             <script>
             function copyTextUrl() {{
                 const btn = document.getElementById('copyUrlBtn');
                 navigator.clipboard.writeText('{s_url}').then(() => {{
                     btn.innerText = '✅ 링크 복사 완료!';
-                    setTimeout(() => {{ btn.innerText = '📋 단축 링크 복사하기'; }}, 2500);
+                    setTimeout(() => {{ btn.innerText = '📋 접속 링크 복사하기'; }}, 2500);
                 }});
             }}
             </script>
@@ -196,7 +174,7 @@ if st.session_state.get("is_teacher_creator", False) and current_code:
 
             st.markdown(
                 f"**💡 배포 팁:**\n"
-                f"- **학급 단톡방 / 알림장:** 위의 파란색 `단축 링크 복사`를 눌러 메시지에 바로 올려주세요.\n"
+                f"- **학급 단톡방 / 알림장:** 파란색 `접속 링크 복사`를 눌러 학생들에게 공유해 주세요. 누르는 즉시 페이지로 바로 들어옵니다.\n"
                 f"- **가정통신문 / 유인물:** 빨간색 `QR 코드 이미지 복사`를 누른 뒤 **한글(HWP)이나 PPT에서 `Ctrl + V`**만 누르면 QR 코드가 들어갑니다.\n"
                 f"- **교실 칠판:** 이 화면의 QR 코드를 교실 TV나 프로젝터에 띄워두시면 학생들이 스마트폰으로 바로 찍어 제출합니다."
             )
@@ -208,7 +186,7 @@ if st.session_state.get("is_teacher_creator", False) and current_code:
 # 전용 링크가 없는 기본 주소로 접속했을 때만 선생님 설정창 표시
 if not current_code:
     with st.expander("⚙️ [선생님 전용] 우리 반 전용 수집 링크 만들기", expanded=True):
-        st.markdown("구매하신 선생님이신가요? 본인의 **구글 앱스크립트(GAS) 웹 앱 URL**을 입력하시면, **우리 반 학생들에게 배포할 단축 링크와 QR 코드**를 즉시 만들어 드립니다.")
+        st.markdown("구매하신 선생님이신가요? 본인의 **구글 앱스크립트(GAS) 웹 앱 URL**을 입력하시면, **우리 반 학생들에게 배포할 다이렉트 접속 링크와 QR 코드**를 즉시 만들어 드립니다.")
         gas_input = st.text_input("구글 앱스크립트(GAS) 웹 앱 URL 입력", value=target_gas_url, type="password")
         
         detected_host = get_current_base_url()
@@ -224,14 +202,13 @@ if not current_code:
             else:
                 encoded_code = base64.urlsafe_b64encode(gas_input.strip().encode("utf-8")).decode("utf-8")
                 base_clean = base_domain_input.strip().rstrip('/')
-                long_url = f"{base_clean}/?t={encoded_code}"
+                direct_url = f"{base_clean}/?t={encoded_code}"
                 
-                with st.spinner("단축 URL 및 QR 코드를 생성하고 있습니다..."):
-                    s_url = make_short_url(long_url)
-                    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&margin=10&data={urllib.parse.quote(s_url)}"
+                with st.spinner("다이렉트 접속 URL 및 QR 코드를 생성하고 있습니다..."):
+                    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&margin=10&data={urllib.parse.quote(direct_url)}"
                     
                     st.session_state["is_teacher_creator"] = True
-                    st.session_state["short_url"] = s_url
+                    st.session_state["share_url"] = direct_url
                     st.session_state["qr_api_url"] = qr_url
                     try:
                         st.session_state["qr_bytes"] = requests.get(qr_url, timeout=5).content
@@ -277,7 +254,6 @@ uploaded_file = st.file_uploader(
 # 영상 처리 및 다중 스캔 스타일 생성 알고리즘
 # ==========================================================
 def robust_order_points(pts):
-    """45도 이상 기울어진 사진도 짧은 변(위/아래)과 긴 변(좌/우)을 구분하여 [좌상, 우상, 우하, 좌하]로 정렬"""
     pts = np.array(pts, dtype="float32").reshape(4, 2)
     center = np.mean(pts, axis=0)
     angles = np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0])
@@ -307,7 +283,6 @@ def robust_order_points(pts):
         return cand_b.astype("float32")
 
 def gentle_deskew(warped, target_w=350, target_h=450, trim_px=3):
-    """미세한 수평 기울기(4.5도 이내)를 보정하고 테두리를 깔끔히 정리"""
     if warped.shape[0] != target_h or warped.shape[1] != target_w:
         warped = cv2.resize(warped, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
         
@@ -343,7 +318,6 @@ def gentle_deskew(warped, target_w=350, target_h=450, trim_px=3):
     return warped
 
 def enhance_studio_lighting(img):
-    """어두운 실내에서 찍힌 실물 사진을 사진관 스캔본처럼 밝고 선명하게 보정"""
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
     
@@ -359,7 +333,6 @@ def enhance_studio_lighting(img):
     return sharpened
 
 def get_skin_mask(hsv_img):
-    """HSV 이미지에서 사람 피부톤 영역 마스크 반환"""
     lower_skin1 = np.array([0, 22, 50], dtype=np.uint8)
     upper_skin1 = np.array([25, 195, 255], dtype=np.uint8)
     lower_skin2 = np.array([170, 22, 50], dtype=np.uint8)
@@ -370,12 +343,6 @@ def get_skin_mask(hsv_img):
     )
 
 def is_valid_portrait_candidate(cropped_img):
-    """
-    [인물 사진 판별기]
-    - 자물쇠, 플라스틱 거치대, 빈 책상 바닥 탈락
-    - 코/입만 확대된 얼굴 클로즈업 오류 탈락
-    - 정통 증명사진 및 폴라로이드 인물 사진 정상 통과
-    """
     h, w = cropped_img.shape[:2]
     gray = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2GRAY).astype("float32")
     hsv = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2HSV)
@@ -405,7 +372,6 @@ def is_valid_portrait_candidate(cropped_img):
     return True
 
 def score_rect_cleanliness(img):
-    """스캔된 사각형의 상단 좌/우 대칭성 및 테두리 깔끔함 점수 계산"""
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype("float32")
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype("float32")
@@ -422,7 +388,6 @@ def score_rect_cleanliness(img):
     return min_bright - lr_diff * 1.6 - max_std * 1.2
 
 def build_3_scan_styles_for_cluster(image, cluster_items):
-    """감지된 인물 사진에 대해 안정적인 3가지 스캔본 생성"""
     target_w, target_h = 350, 450
     dst = np.array([[0, 0], [target_w-1, 0], [target_w-1, target_h-1], [0, target_h-1]], dtype="float32")
     
@@ -434,7 +399,6 @@ def build_3_scan_styles_for_cluster(image, cluster_items):
         hull = item['cnt']
         peri = cv2.arcLength(hull, True)
         
-        # 1. 외곽 사각형 기반 스캔
         rect = cv2.minAreaRect(hull)
         r_pts = robust_order_points(cv2.boxPoints(rect).astype("float32"))
         M_r = cv2.getPerspectiveTransform(r_pts, dst)
@@ -442,7 +406,6 @@ def build_3_scan_styles_for_cluster(image, cluster_items):
         if is_valid_portrait_candidate(w_r):
             all_candidates.append((score_rect_cleanliness(w_r), w_r))
             
-        # 2. 다각형 4점 기반 스캔
         for eps in [0.02, 0.025, 0.03]:
             approx = cv2.approxPolyDP(hull, eps * peri, True)
             if len(approx) == 4 and cv2.isContourConvex(approx):
@@ -457,17 +420,12 @@ def build_3_scan_styles_for_cluster(image, cluster_items):
         return None
         
     all_candidates.sort(key=lambda x: x[0], reverse=True)
-    best_standard = all_candidates[0][1]
+    style_a = all_candidates[0][1]
     
-    # 타입 A: 표준 자동 스캔
-    style_a = best_standard
-    
-    # 타입 B: 테두리 밀착 스캔 (여백 5% 제거)
     tx_tight, ty_tight = int(target_w * 0.05), int(target_h * 0.05)
     tight_crop = style_a[ty_tight:target_h-ty_tight, tx_tight:target_w-tx_tight]
     style_b = cv2.resize(tight_crop, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
     
-    # 타입 C: 화사한 조명·선명도 보정본
     style_c = enhance_studio_lighting(style_a)
     
     return [
@@ -477,12 +435,10 @@ def build_3_scan_styles_for_cluster(image, cluster_items):
     ]
 
 def extract_photo_groups(image, is_digital_mode=False):
-    """업로드된 이미지에서 인물 사진들을 찾고, 각 사진마다 3가지 스캔본을 묶어서 반환"""
     target_w, target_h = 350, 450
     img_h, img_w = image.shape[:2]
     img_area = img_h * img_w
     
-    # 1. 디지털 원본 파일 모드이거나 이미 여백 없는 사진인 경우
     top_b = image[0:5, :, :]
     bottom_b = image[img_h-5:img_h, :, :]
     left_b = image[:, 0:5, :]
@@ -513,7 +469,6 @@ def extract_photo_groups(image, is_digital_mode=False):
                 ("타입 C: 화사한 조명·선명도 보정본", studio_bright)
             ]]
             
-    # 2. 실물 촬영본 다중 탐색
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     hsv_full = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
@@ -567,7 +522,6 @@ def extract_photo_groups(image, is_digital_mode=False):
         
     raw_items.sort(key=lambda x: x['area'], reverse=True)
     
-    # 위치별 클러스터링 (독립된 사진들 분리)
     clusters = []
     for item in raw_items:
         cx1, cy1 = item['center']
