@@ -1,17 +1,19 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import cv2
 import numpy as np
 import os
 import io
 import base64
 import requests
+import urllib.parse
 
 # 페이지 설정
 st.set_page_config(page_title="증명사진 수집 시스템", page_icon="📸")
 
 # 세션 상태 초기화
 if "photo_groups" not in st.session_state:
-    st.session_state["photo_groups"] = None  # 감지된 사진별 [스캔본 3종 리스트]
+    st.session_state["photo_groups"] = None
 if "selected_photo_idx" not in st.session_state:
     st.session_state["selected_photo_idx"] = 0
 if "selected_style_idx" not in st.session_state:
@@ -25,6 +27,14 @@ if "final_uploaded" not in st.session_state:
 if "uploader_key" not in st.session_state:
     st.session_state["uploader_key"] = 0
 
+# 선생님 링크 및 QR 정보 세션 저장
+if "short_url" not in st.session_state:
+    st.session_state["short_url"] = ""
+if "qr_api_url" not in st.session_state:
+    st.session_state["qr_api_url"] = ""
+if "qr_bytes" not in st.session_state:
+    st.session_state["qr_bytes"] = None
+
 def reset_scan_state():
     """재업로드/재촬영을 위해 모든 스캔 상태를 초기화"""
     st.session_state["photo_groups"] = None
@@ -33,6 +43,39 @@ def reset_scan_state():
     st.session_state["rotation_deg"] = 0
     st.session_state["final_uploaded"] = None
     st.session_state["uploader_key"] += 1
+
+def get_current_base_url():
+    """현재 Streamlit 앱의 도메인(Base URL) 감지"""
+    try:
+        ctx = getattr(st, "context", None)
+        if ctx and hasattr(ctx, "headers"):
+            host = ctx.headers.get("host", "")
+            proto = ctx.headers.get("x-forwarded-proto", "https")
+            if host:
+                return f"{proto}://{host}"
+    except Exception:
+        pass
+    return ""
+
+def make_short_url(long_url):
+    """긴 웹 주소를 간결한 단축 URL(TinyURL / is.gd)로 변환"""
+    try:
+        api_url = f"https://tinyurl.com/api-create.php?url={urllib.parse.quote(long_url)}"
+        resp = requests.get(api_url, timeout=4)
+        if resp.status_code == 200 and resp.text.startswith("http"):
+            return resp.text.strip()
+    except Exception:
+        pass
+        
+    try:
+        api_url = f"https://is.gd/create.php?format=simple&url={urllib.parse.quote(long_url)}"
+        resp = requests.get(api_url, timeout=4)
+        if resp.status_code == 200 and resp.text.startswith("http"):
+            return resp.text.strip()
+    except Exception:
+        pass
+        
+    return long_url
 
 # 1. URL 주소에서 선생님 고유 코드(?t=...) 자동 인식 (Secrets 백업 호환)
 current_code = st.query_params.get("t", "")
@@ -49,24 +92,154 @@ elif "gas_url" in st.secrets:
 st.title("📸 증명사진 수집 및 자동 스캔")
 st.write("학번과 이름을 입력하고 증명사진을 올리면, 여러 형태의 스캔본 중 가장 마음에 드는 사진을 직접 골라 선생님께 제출할 수 있습니다.")
 
-# --- ⚙️ 선생님 전용 영역 제어 ---
+# --- ⚙️ [선생님 전용 영역] 단축 URL & QR 코드 배포 센터 ---
 if st.session_state.get("is_teacher_creator", False) and current_code:
-    st.success("🎉 **우리 반 전용 링크가 활성화되었습니다!**")
-    st.info("👉 **현재 브라우저 주소창의 전체 주소를 복사하여 학생들에게 공유**해 주세요.\n(학생들이 접속할 때는 이 안내 배너와 설정창이 자동으로 숨겨집니다.)")
+    with st.container():
+        st.success("🎉 **우리 반 전용 단축 링크와 QR 코드가 생성되었습니다!**")
+        
+        # 단축 URL 및 QR 이미지가 세션에 없으면 생성
+        if not st.session_state["short_url"] or not st.session_state["qr_api_url"]:
+            detected_base = get_current_base_url() or "https://share.streamlit.io"
+            long_url = f"{detected_base}/?t={current_code}"
+            s_url = make_short_url(long_url)
+            qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&margin=10&data={urllib.parse.quote(s_url)}"
+            st.session_state["short_url"] = s_url
+            st.session_state["qr_api_url"] = qr_url
+            try:
+                st.session_state["qr_bytes"] = requests.get(qr_url, timeout=5).content
+            except Exception:
+                st.session_state["qr_bytes"] = None
 
+        s_url = st.session_state["short_url"]
+        qr_url = st.session_state["qr_api_url"]
+        qr_bytes = st.session_state["qr_bytes"]
+
+        qr_col, link_col = st.columns([1, 1.4])
+        with qr_col:
+            st.image(qr_url, width=220, caption="교실 TV / 가정통신문용 QR 코드")
+            
+            # HTML5 Clipboard API를 활용한 원클릭 QR 이미지 복사 컴포넌트
+            copy_qr_html = f"""
+            <div style="margin-top: 5px; margin-bottom: 8px;">
+                <button id="copyQrBtn" onclick="copyQrImage()" style="
+                    width: 220px;
+                    padding: 8px 12px;
+                    background-color: #ff4b4b;
+                    color: white;
+                    border: none;
+                    border-radius: 6px;
+                    font-size: 13px;
+                    font-weight: bold;
+                    cursor: pointer;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.15);
+                ">📋 QR 코드 이미지 복사 (한글/PPT용)</button>
+            </div>
+            <script>
+            async function copyQrImage() {{
+                const btn = document.getElementById('copyQrBtn');
+                try {{
+                    btn.innerText = '⏳ 복사 중...';
+                    const response = await fetch('{qr_url}');
+                    const blob = await response.blob();
+                    await navigator.clipboard.write([
+                        new ClipboardItem({{ [blob.type]: blob }})
+                    ]);
+                    btn.innerText = '✅ 복사 완료! (Ctrl+V로 붙여넣기)';
+                    setTimeout(() => {{ btn.innerText = '📋 QR 코드 이미지 복사 (한글/PPT용)'; }}, 3000);
+                }} catch (err) {{
+                    btn.innerText = '⚠️ 복사 실패 (아래 다운로드 이용)';
+                    setTimeout(() => {{ btn.innerText = '📋 QR 코드 이미지 복사 (한글/PPT용)'; }}, 3000);
+                }}
+            }}
+            </script>
+            """
+            components.html(copy_qr_html, height=48)
+            
+            if qr_bytes:
+                st.download_button(
+                    label="💾 QR 코드 이미지 다운로드 (PNG)",
+                    data=qr_bytes,
+                    file_name="우리반_증명사진_제출_QR코드.png",
+                    mime="image/png",
+                    use_container_width=False
+                )
+
+        with link_col:
+            st.markdown("### 🔗 학생 배포용 단축 URL")
+            st.code(s_url, language=None)
+            
+            # 단축 URL 복사 버튼 컴포넌트
+            copy_url_html = f"""
+            <div style="margin-bottom: 12px;">
+                <button id="copyUrlBtn" onclick="copyTextUrl()" style="
+                    padding: 7px 14px;
+                    background-color: #2e7bcf;
+                    color: white;
+                    border: none;
+                    border-radius: 6px;
+                    font-size: 13px;
+                    font-weight: bold;
+                    cursor: pointer;
+                ">📋 단축 링크 복사하기</button>
+            </div>
+            <script>
+            function copyTextUrl() {{
+                const btn = document.getElementById('copyUrlBtn');
+                navigator.clipboard.writeText('{s_url}').then(() => {{
+                    btn.innerText = '✅ 링크 복사 완료!';
+                    setTimeout(() => {{ btn.innerText = '📋 단축 링크 복사하기'; }}, 2500);
+                }});
+            }}
+            </script>
+            """
+            components.html(copy_url_html, height=42)
+
+            st.markdown(
+                f"**💡 배포 팁:**\n"
+                f"- **학급 단톡방 / 알림장:** 위의 파란색 `단축 링크 복사`를 눌러 메시지에 바로 올려주세요.\n"
+                f"- **가정통신문 / 유인물:** 빨간색 `QR 코드 이미지 복사`를 누른 뒤 **한글(HWP)이나 PPT에서 `Ctrl + V`**만 누르면 QR 코드가 들어갑니다.\n"
+                f"- **교실 칠판:** 이 화면의 QR 코드를 교실 TV나 프로젝터에 띄워두시면 학생들이 스마트폰으로 바로 찍어 제출합니다."
+            )
+            
+            if st.button("👀 학생 제출 화면 확인하기 (안내창 닫기)", type="secondary"):
+                st.session_state["is_teacher_creator"] = False
+                st.rerun()
+
+# 전용 링크가 없는 기본 주소로 접속했을 때만 선생님 설정창 표시
 if not current_code:
     with st.expander("⚙️ [선생님 전용] 우리 반 전용 수집 링크 만들기", expanded=True):
-        st.markdown("구매하신 선생님이신가요? 본인의 **구글 앱스크립트(GAS) 웹 앱 URL**을 입력하시면, **우리 반 학생들에게 배포할 전용 링크**를 즉시 만들어 드립니다.")
+        st.markdown("구매하신 선생님이신가요? 본인의 **구글 앱스크립트(GAS) 웹 앱 URL**을 입력하시면, **우리 반 학생들에게 배포할 단축 링크와 QR 코드**를 즉시 만들어 드립니다.")
         gas_input = st.text_input("구글 앱스크립트(GAS) 웹 앱 URL 입력", value=target_gas_url, type="password")
         
-        if st.button("우리 반 전용 링크 발급하기"):
+        detected_host = get_current_base_url()
+        base_domain_input = st.text_input(
+            "현재 웹 앱 기본 주소 (자동 감지됨)", 
+            value=detected_host if detected_host else "https://share.streamlit.io",
+            help="학생들이 접속할 기본 웹사이트 주소입니다. 브라우저 주소창의 도메인이 맞는지 확인해 주세요."
+        )
+        
+        if st.button("우리 반 전용 링크 & QR 코드 발급하기", type="primary"):
             if not gas_input.strip():
                 st.warning("⚠️ 구글 앱스크립트 URL을 입력해주세요!")
             else:
                 encoded_code = base64.urlsafe_b64encode(gas_input.strip().encode("utf-8")).decode("utf-8")
-                st.session_state["is_teacher_creator"] = True
-                st.query_params["t"] = encoded_code
-                st.rerun()
+                base_clean = base_domain_input.strip().rstrip('/')
+                long_url = f"{base_clean}/?t={encoded_code}"
+                
+                with st.spinner("단축 URL 및 QR 코드를 생성하고 있습니다..."):
+                    s_url = make_short_url(long_url)
+                    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&margin=10&data={urllib.parse.quote(s_url)}"
+                    
+                    st.session_state["is_teacher_creator"] = True
+                    st.session_state["short_url"] = s_url
+                    st.session_state["qr_api_url"] = qr_url
+                    try:
+                        st.session_state["qr_bytes"] = requests.get(qr_url, timeout=5).content
+                    except Exception:
+                        st.session_state["qr_bytes"] = None
+                        
+                    st.query_params["t"] = encoded_code
+                    st.rerun()
 
 st.markdown("---")
 
@@ -174,7 +347,6 @@ def enhance_studio_lighting(img):
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
     
-    # CLAHE로 자연스러운 명암비 개선 및 밝기 상승
     clahe = cv2.createCLAHE(clipLimit=1.6, tileGridSize=(8, 8))
     l_enhanced = clahe.apply(l_ch)
     l_blended = cv2.addWeighted(l_enhanced, 0.65, l_ch, 0.35, 6)
@@ -209,13 +381,11 @@ def is_valid_portrait_candidate(cropped_img):
     hsv = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2HSV)
     skin_mask = get_skin_mask(hsv)
     
-    # 1. 전체 명암 대비 검사 (단색 배경/암전 배제)
     overall_mean = float(gray.mean())
     overall_std = float(gray.std())
     if overall_mean < 55.0 or overall_mean > 242.0 or overall_std < 22.0:
         return False
         
-    # 2. 중심부 피부톤 비율 검사
     center_skin = skin_mask[int(h * 0.18):int(h * 0.75), int(w * 0.20):int(w * 0.80)]
     center_skin_ratio = float((center_skin > 0).mean())
     overall_skin_ratio = float((skin_mask > 0).mean())
@@ -223,12 +393,10 @@ def is_valid_portrait_candidate(cropped_img):
     if center_skin_ratio < 0.07 or center_skin_ratio > 0.66 or overall_skin_ratio > 0.50:
         return False
         
-    # 3. 사진 최상단 끝 테두리 피부 침범 검사 (얼굴 클로즈업 탈락)
     top_edge_skin = float((skin_mask[0:int(h * 0.08), :] > 0).mean())
     if top_edge_skin > 0.18:
         return False
         
-    # 4. 중심부 이목구비 윤곽선 밀도 검사
     gray_roi = cv2.cvtColor(cropped_img[int(h * 0.15):int(h * 0.78), int(w * 0.18):int(w * 0.82)], cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray_roi, 45, 140)
     if (edges > 0).sum() < 95:
@@ -254,10 +422,7 @@ def score_rect_cleanliness(img):
     return min_bright - lr_diff * 1.6 - max_std * 1.2
 
 def build_3_scan_styles_for_cluster(image, cluster_items):
-    """
-    감지된 인물 사진에 대해 안정적이고 명확한 3가지 스캔본 생성
-    (직각보정 왜곡 로직 제거)
-    """
+    """감지된 인물 사진에 대해 안정적인 3가지 스캔본 생성"""
     target_w, target_h = 350, 450
     dst = np.array([[0, 0], [target_w-1, 0], [target_w-1, target_h-1], [0, target_h-1]], dtype="float32")
     
@@ -294,10 +459,10 @@ def build_3_scan_styles_for_cluster(image, cluster_items):
     all_candidates.sort(key=lambda x: x[0], reverse=True)
     best_standard = all_candidates[0][1]
     
-    # 타입 A: 표준 자동 스캔 (기본)
+    # 타입 A: 표준 자동 스캔
     style_a = best_standard
     
-    # 타입 B: 테두리 밀착 스캔 (테두리 여백/바닥 잔상을 5% 안쪽으로 깔끔하게 정리)
+    # 타입 B: 테두리 밀착 스캔 (여백 5% 제거)
     tx_tight, ty_tight = int(target_w * 0.05), int(target_h * 0.05)
     tight_crop = style_a[ty_tight:target_h-ty_tight, tx_tight:target_w-tx_tight]
     style_b = cv2.resize(tight_crop, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
@@ -312,15 +477,12 @@ def build_3_scan_styles_for_cluster(image, cluster_items):
     ]
 
 def extract_photo_groups(image, is_digital_mode=False):
-    """
-    업로드된 이미지에서 인물 사진들을 찾고,
-    각 사진마다 3가지 스캔본(표준, 밀착, 조명보정)을 리스트로 반환
-    """
+    """업로드된 이미지에서 인물 사진들을 찾고, 각 사진마다 3가지 스캔본을 묶어서 반환"""
     target_w, target_h = 350, 450
     img_h, img_w = image.shape[:2]
     img_area = img_h * img_w
     
-    # 1. 디지털 원본 파일 모드이거나 이미 여백 없는 디지털 사진인 경우
+    # 1. 디지털 원본 파일 모드이거나 이미 여백 없는 사진인 경우
     top_b = image[0:5, :, :]
     bottom_b = image[img_h-5:img_h, :, :]
     left_b = image[:, 0:5, :]
@@ -493,7 +655,7 @@ if st.session_state["photo_groups"] is not None:
         p_cols = st.columns(len(groups))
         for p_idx, (p_col, style_list) in enumerate(zip(p_cols, groups)):
             with p_col:
-                rep_img = style_list[0][1]  # 대표 이미지(타입 A)
+                rep_img = style_list[0][1]
                 is_picked_photo = (st.session_state["selected_photo_idx"] == p_idx)
                 st.image(rep_img, channels="BGR", caption=f"감지된 사진 #{p_idx + 1}")
                 btn_txt = f"✅ 사진 #{p_idx + 1} 선택됨" if is_picked_photo else f"사진 #{p_idx + 1} 선택하기"
