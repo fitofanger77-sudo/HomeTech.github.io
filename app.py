@@ -124,10 +124,10 @@ if st.session_state.get("is_teacher_creator", False) and current_code:
                         new ClipboardItem({{ [blob.type]: blob }})
                     ]);
                     btn.innerText = '✅ 복사 완료! (Ctrl+V로 붙여넣기)';
-                    setTimeout(() => {{ btn.innerText = '📋 QR 코드 이미지 복사 (한글/PPT용)'; }}, 3000);
+                    setTimeout(() => {{ btn.innerText = '📋 QR 코드 이미지 복사'; }}, 3000);
                 }} catch (err) {{
                     btn.innerText = '⚠️ 복사 실패 (아래 다운로드 이용)';
-                    setTimeout(() => {{ btn.innerText = '📋 QR 코드 이미지 복사 (한글/PPT용)'; }}, 3000);
+                    setTimeout(() => {{ btn.innerText = '📋 QR 코드 이미지 복사'; }}, 3000);
                 }}
             }}
             </script>
