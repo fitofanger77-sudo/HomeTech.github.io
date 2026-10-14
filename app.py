@@ -111,7 +111,7 @@ if st.session_state.get("is_teacher_creator", False) and current_code:
                     font-weight: bold;
                     cursor: pointer;
                     box-shadow: 0 2px 4px rgba(0,0,0,0.15);
-                ">📋 QR 코드 이미지 복사 (한글/PPT용)</button>
+                ">📋 QR 코드 이미지 복사</button>
             </div>
             <script>
             async function copyQrImage() {{
